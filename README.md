@@ -36,3 +36,7 @@ cargo build -p mineral-gui-bridge --release
 - `Z` / `Esc`：进入沉浸模式 / 返回上一层或退出全屏与迷你窗
 - `?`：查看快捷键说明
 
+## 许可证
+
+本项目采用 [GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE) 开源许可。
+

@@ -236,7 +236,7 @@ def create_rpm(stage_dir: Path, out_rpm: Path, build_time: int) -> None:
     add_meta(1006, pack_int32([build_time]))
     add_meta(1007, pack_str("localhost"))
     add_meta(1009, pack_int32([total_size]))
-    add_meta(1014, pack_str("MIT"))
+    add_meta(1014, pack_str("AGPL-3.0-only"))
     add_meta(1016, pack_str("Productivity/Multimedia/Sound/Players"))
     add_meta(1020, pack_str("https://github.com/mineral-music/mineral"))
     add_meta(1021, pack_str("linux"))
