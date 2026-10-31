@@ -1,11 +1,11 @@
 <div align="center">
 
-# Mineral GUI
+# Oh-My-Mineral
 
 **[Mineral](https://github.com/10knamesmore/Mineral) 的跨平台桌面图形客户端（Linux / macOS / Windows）**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
-[![Releases](https://img.shields.io/github/v/release/WeissHymmnos/mineral-gui)](https://github.com/WeissHymmnos/mineral-gui/releases)
+[![Releases](https://img.shields.io/github/v/release/WeissHymmnos/Oh-My-Mineral)](https://github.com/WeissHymmnos/Oh-My-Mineral/releases)
 
 <img src="./assets/screenshot-main.png" alt="Mineral GUI 主界面：动态取色横幅、播放队列与新专辑网格" width="820"/>
 
@@ -25,7 +25,7 @@
 
 ## 下载与安装
 
-前往 **[GitHub Releases](https://github.com/WeissHymmnos/mineral-gui/releases)** 下载对应平台的安装包：
+前往 **[GitHub Releases](https://github.com/WeissHymmnos/Oh-My-Mineral/releases)** 下载对应平台的安装包：
 
 - **Linux (RPM)**：`sudo rpm -Uvh mineral-gui-0.1.0-1.x86_64.rpm`
 - **Linux (DEB)**：`sudo apt install ./mineral-gui_0.1.0-1_amd64.deb`

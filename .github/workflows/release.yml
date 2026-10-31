@@ -29,7 +29,7 @@ jobs:
       - name: Fetch or Build Mineral Daemon
         run: |
           mkdir -p "$HOME/.cargo/bin"
-          if curl -fsSL "https://github.com/WeissHymmnos/mineral-gui/releases/download/v0.1.0/mineral-gui-0.1.0-linux-x86_64.tar.gz" -o /tmp/mineral-linux.tar.gz; then
+          if curl -fsSL "https://github.com/WeissHymmnos/Oh-My-Mineral/releases/download/v0.1.0/mineral-gui-0.1.0-linux-x86_64.tar.gz" -o /tmp/mineral-linux.tar.gz; then
             tar -xzf /tmp/mineral-linux.tar.gz -C /tmp
             cp /tmp/mineral-gui-0.1.0-linux-x86_64/mineral "$HOME/.cargo/bin/mineral"
             chmod +x "$HOME/.cargo/bin/mineral"
