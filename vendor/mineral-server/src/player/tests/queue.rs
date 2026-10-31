@@ -1,0 +1,639 @@
+//! queue 导航 · shuffle · play_mode · version bump · skip 记录。
+
+use std::sync::Arc;
+
+use mineral_model::{Lyrics, Song, SongId, SourceKind};
+use mineral_protocol::{AdvanceKind, PlayCursor, PlayMode, PlayerVersions};
+use mineral_test::song;
+use parking_lot::Mutex;
+use pretty_assertions::assert_eq;
+
+use super::fixtures::core_with;
+use super::waiting::drain_spawned;
+use crate::queue::{
+    advance_next, advance_prev, apply_play_mode, enter_shuffle, exit_shuffle, next_in_queue,
+    prev_index,
+};
+use crate::state::State;
+
+/// 造一个含队列的 State:queue=ids、游标附着在 sel、current=queue[sel]、mode。
+fn state_with(ids: &[&str], sel: usize, mode: PlayMode) -> State {
+    let mut st = State::empty();
+    st.queue = ids.iter().map(|&i| song(i)).collect();
+    st.cursor = PlayCursor::InQueue(sel);
+    st.current_song = st.queue.get(sel).cloned();
+    st.play_mode = mode;
+    st
+}
+
+/// 游标的基准下标——只关心「推进算到第几位」的断言用它,不必区分附着 / 悬空。
+fn sel_of(st: &State) -> usize {
+    st.cursor.anchor()
+}
+
+/// 取队列各歌 id(原序)。
+fn ids(songs: &[Song]) -> Vec<&str> {
+    songs.iter().map(|s| s.id.as_str()).collect()
+}
+
+/// 取队列各歌 id 并排序(用于「内容集合不变」断言,不看顺序)。
+fn ids_sorted(songs: &[Song]) -> Vec<&str> {
+    let mut v = ids(songs);
+    v.sort_unstable();
+    v
+}
+
+/// prev:Sequential 首位返回 None,否则取上一首的下标。
+#[test]
+fn prev_sequential_stops_at_start() {
+    assert!(prev_index(&state_with(&["a", "b", "c"], 0, PlayMode::Sequential)).is_none());
+    assert_eq!(
+        prev_index(&state_with(&["a", "b", "c"], 2, PlayMode::Sequential)),
+        Some(1) // b
+    );
+}
+
+/// prev:RepeatAll / Shuffle 在首部环回到尾,RepeatOne 原地(均以下标计)。
+#[test]
+fn prev_wraps_and_repeats_one() {
+    assert_eq!(
+        prev_index(&state_with(&["a", "b", "c"], 0, PlayMode::RepeatAll)),
+        Some(2) // c
+    );
+    assert_eq!(
+        prev_index(&state_with(&["a", "b", "c"], 0, PlayMode::Shuffle)),
+        Some(2) // c
+    );
+    assert_eq!(
+        prev_index(&state_with(&["a", "b", "c"], 1, PlayMode::RepeatOne)),
+        Some(1) // b
+    );
+}
+
+/// 回归:队列含交替重复曲时,顺序推进必须按下标单向前进、走到队尾后停,
+/// **不得**在两个重复副本之间来回吸附成无限循环。按歌曲身份 first-match 定位会
+/// 把游标拽回首个副本并触发该循环。
+#[test]
+fn advance_next_walks_past_duplicates_without_looping() {
+    // gk 在下标 1/3、400 在下标 2/5;从正在播的 400(下标 2)起逐首推进。
+    let mut st = state_with(
+        &["intro", "gk", "400", "gk", "fish", "400", "outro"],
+        2,
+        PlayMode::Sequential,
+    );
+    let mut visited = Vec::new();
+    while let Some(_song) = advance_next(&mut st) {
+        visited.push(sel_of(&st));
+    }
+    // 2→3→4→5→6 后到队尾停;每步严格 +1,绝不回退到 1 或 2。
+    assert_eq!(visited, vec![3, 4, 5, 6]);
+    assert_eq!(sel_of(&st), 6, "推进到队尾后游标停在末位");
+}
+
+/// 回归:advance_prev 同样按下标后退,重复曲不把 queue_sel 吸附到首个副本。
+#[test]
+fn advance_prev_steps_back_by_index_with_duplicates() {
+    let mut st = state_with(&["a", "b", "a", "b"], 3, PlayMode::Sequential); // 第二个 b
+    assert_eq!(
+        advance_prev(&mut st).as_ref().map(|s| s.id.as_str()),
+        Some("a")
+    );
+    assert_eq!(sel_of(&st), 2, "应退到下标 2(第二个 a),而非首个 a@0");
+    assert_eq!(
+        advance_prev(&mut st).as_ref().map(|s| s.id.as_str()),
+        Some("b")
+    );
+    assert_eq!(sel_of(&st), 1);
+}
+
+/// 空队列时 next / prev 都返回 None。
+#[test]
+fn empty_queue_has_no_neighbors() {
+    assert!(next_in_queue(&State::empty()).is_none());
+    assert!(prev_index(&State::empty()).is_none());
+}
+
+/// 游标越界被 clamp 到末位:Sequential next=None、prev=倒数第二首。
+#[test]
+fn out_of_bounds_sel_is_clamped() {
+    let st = state_with(&["a", "b"], 5, PlayMode::Sequential);
+    assert!(next_in_queue(&st).is_none());
+    assert_eq!(prev_index(&st), Some(0)); // a
+}
+
+/// enter_shuffle:内容集合不变 + 当前歌置顶 + 游标落 0 + original 存原序。
+#[test]
+fn enter_shuffle_keeps_all_and_pins_current() {
+    let mut st = state_with(&["a", "b", "c", "d"], 2, PlayMode::Sequential); // current=c
+    enter_shuffle(&mut st);
+    assert_eq!(st.queue.first().map(|s| s.id.as_str()), Some("c"));
+    assert_eq!(st.cursor, PlayCursor::InQueue(0));
+    assert_eq!(ids_sorted(&st.queue), vec!["a", "b", "c", "d"]);
+    assert_eq!(
+        st.original_queue.as_deref().map(ids),
+        Some(vec!["a", "b", "c", "d"])
+    );
+}
+
+/// enter_shuffle:空队列 no-op,不设 original。
+#[test]
+fn enter_shuffle_empty_is_noop() {
+    let mut st = State::empty();
+    enter_shuffle(&mut st);
+    assert!(st.queue.is_empty());
+    assert!(st.original_queue.is_none());
+}
+
+/// exit_shuffle:从 original 还原原序,游标重定位到当前歌,清 original。
+#[test]
+fn exit_shuffle_restores_order_and_relocates_sel() {
+    let mut st = state_with(&["a", "b", "c", "d"], 0, PlayMode::Shuffle);
+    st.queue = vec![song("c"), song("a"), song("d"), song("b")];
+    st.cursor = PlayCursor::InQueue(0);
+    st.current_song = Some(song("c"));
+    st.original_queue = Some(vec![song("a"), song("b"), song("c"), song("d")]);
+    exit_shuffle(&mut st);
+    assert_eq!(ids(&st.queue), vec!["a", "b", "c", "d"]);
+    assert_eq!(st.cursor, PlayCursor::InQueue(2)); // c 在原序的下标
+    assert!(st.original_queue.is_none());
+}
+
+/// exit_shuffle:没有 original 时 no-op。
+#[test]
+fn exit_shuffle_without_original_is_noop() {
+    let mut st = state_with(&["a", "b"], 1, PlayMode::Sequential);
+    st.original_queue = None;
+    exit_shuffle(&mut st);
+    assert_eq!(ids(&st.queue), vec!["a", "b"]);
+    assert_eq!(st.cursor, PlayCursor::InQueue(1));
+}
+
+/// apply_play_mode:目标与当前相同时 no-op。
+#[test]
+fn apply_same_mode_is_noop() {
+    let mut st = state_with(&["a", "b"], 0, PlayMode::Sequential);
+    apply_play_mode(&mut st, PlayMode::Sequential);
+    assert_eq!(st.play_mode, PlayMode::Sequential);
+    assert!(st.original_queue.is_none());
+}
+
+/// enter/exit shuffle 必须推进 queue_version(漏 bump = client 永远看不到洗牌结果)。
+#[test]
+fn shuffle_boundaries_bump_queue_version() {
+    let mut st = state_with(&["a", "b", "c"], 1, PlayMode::Sequential);
+    let v0 = st.queue_version;
+    apply_play_mode(&mut st, PlayMode::Shuffle);
+    assert_eq!(st.queue_version, v0.next(), "进 Shuffle 洗牌后应 bump");
+    apply_play_mode(&mut st, PlayMode::Sequential);
+    assert_eq!(
+        st.queue_version,
+        v0.next().next(),
+        "退 Shuffle 还原后应 bump"
+    );
+}
+
+/// shuffle 边界的 no-op 路径(空队列进入 / 无 original 退出)不得虚涨版本。
+#[test]
+fn noop_shuffle_paths_do_not_bump() {
+    let mut empty = State::empty();
+    let v0 = empty.queue_version;
+    enter_shuffle(&mut empty);
+    assert_eq!(empty.queue_version, v0, "空队列进 Shuffle 是 no-op");
+
+    let mut st = state_with(&["a", "b"], 1, PlayMode::Sequential);
+    let v1 = st.queue_version;
+    exit_shuffle(&mut st);
+    assert_eq!(st.queue_version, v1, "无 original 退 Shuffle 是 no-op");
+}
+
+/// 非 Shuffle 边界的模式切换(RepeatAll → RepeatOne)不动 queue,不得 bump。
+#[test]
+fn mode_change_without_queue_mutation_does_not_bump() {
+    let mut st = state_with(&["a", "b"], 0, PlayMode::RepeatAll);
+    let v0 = st.queue_version;
+    apply_play_mode(&mut st, PlayMode::RepeatOne);
+    assert_eq!(st.queue_version, v0);
+}
+
+/// replace_queue(两种模式)必须推进 queue_version。
+#[tokio::test]
+async fn replace_queue_bumps_queue_version() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    let v0 = core.sync(PlayerVersions::default()).versions.queue;
+    core.replace_queue(
+        vec![song("a"), song("b")],
+        0,
+        mineral_stats::QueueContext::Unknown,
+    )?;
+    let v1 = core.sync(PlayerVersions::default()).versions.queue;
+    assert_eq!(v1, v0.next(), "顺序模式 replace_queue 应 bump");
+
+    core.set_play_mode(PlayMode::Shuffle, mineral_stats::Actor::User); // 进 Shuffle 本身也 bump 一次
+    let v2 = core.sync(PlayerVersions::default()).versions.queue;
+    core.replace_queue(
+        vec![song("c"), song("d")],
+        0,
+        mineral_stats::QueueContext::Unknown,
+    )?;
+    let v3 = core.sync(PlayerVersions::default()).versions.queue;
+    assert_eq!(v3, v2.next(), "Shuffle 模式 replace_queue 应 bump");
+    Ok(())
+}
+
+/// 超长 atomic replace 整体拒绝，不 truncate，也不修改已有 queue。
+#[tokio::test]
+async fn replace_queue_rejects_over_cap_atomically() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    let cap = crate::queue::QUEUE_CAP;
+    let over = (0..(cap + 5))
+        .map(|i| song(&i.to_string()))
+        .collect::<Vec<_>>();
+    core.replace_queue(
+        vec![song("existing")],
+        0,
+        mineral_stats::QueueContext::Unknown,
+    )?;
+    let error = core
+        .replace_queue(over, 0, mineral_stats::QueueContext::Manual)
+        .err()
+        .ok_or_else(|| color_eyre::eyre::eyre!("超 cap 应拒绝"))?;
+    assert_eq!(
+        error,
+        mineral_protocol::PlayQueueError::CapacityExceeded { len: cap + 5, cap }
+    );
+    let ids = core.with_state(|state| {
+        state
+            .queue
+            .iter()
+            .map(|song| song.id.value().to_owned())
+            .collect::<Vec<String>>()
+    });
+    assert_eq!(ids, vec!["existing".to_owned()], "非法请求后原 queue 不变");
+    Ok(())
+}
+
+/// 空批次与容量不足均保持整份队列、语境和正在进行的预取，shuffle 原序也不变。
+#[tokio::test]
+async fn enqueue_rejects_batches_without_changing_playback_state() -> color_eyre::Result<()> {
+    for enqueue in [
+        crate::player::PlayerCore::queue_append,
+        crate::player::PlayerCore::queue_insert_next,
+    ] {
+        for mode in [PlayMode::Sequential, PlayMode::Shuffle] {
+            let core = core_with(Arc::default())?;
+            let queue = (0..crate::queue::QUEUE_CAP - 1)
+                .map(|i| song(&i.to_string()))
+                .collect::<Vec<_>>();
+            let original = (mode == PlayMode::Shuffle).then(|| queue.clone());
+            let prefetch = crate::playback_instance::PlaybackSlot::new(song("1").id);
+            let versions = core.with_state(|st| {
+                st.queue = queue.clone();
+                st.original_queue = original.clone();
+                st.play_mode = mode;
+                st.current_song = Some(song("0"));
+                st.cursor = PlayCursor::InQueue(0);
+                st.queue_context = mineral_stats::QueueContext::Manual;
+                st.context_overrides.insert(
+                    song("0").id.qualified(),
+                    mineral_stats::QueueContext::Manual,
+                );
+                st.prefetch.replace_opening(prefetch.clone());
+                st.prefetch_vetoed = vec![2];
+                (st.queue_version, st.current_version)
+            });
+            for batch in [vec![song("0"), song("overflow")], Vec::new()] {
+                assert!(!enqueue(&core, batch, mineral_stats::QueueContext::Unknown));
+                core.with_state(|st| {
+                    assert_eq!(st.queue, queue);
+                    assert_eq!(st.original_queue, original);
+                    assert_eq!(st.queue_context, mineral_stats::QueueContext::Manual);
+                    assert_eq!(st.context_overrides.len(), 1);
+                    assert_eq!(
+                        st.context_overrides.get(&song("0").id.qualified()),
+                        Some(&mineral_stats::QueueContext::Manual)
+                    );
+                    assert_eq!(st.cursor, PlayCursor::InQueue(0));
+                    assert_eq!(st.current_song, Some(song("0")));
+                    assert_eq!(st.play_mode, mode);
+                    assert_eq!((st.queue_version, st.current_version), versions);
+                    assert_eq!(
+                        st.prefetch.slot().map(|slot| slot.instance_id),
+                        Some(prefetch.instance_id)
+                    );
+                    assert_eq!(st.prefetch_vetoed, vec![2]);
+                    assert!(!prefetch.cancellation.is_cancelled());
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Empty 与越界 target 均 structured reject，且不会改已有 queue/context/cursor。
+#[tokio::test]
+async fn replace_queue_rejects_empty_and_invalid_target_atomically() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    core.replace_queue(
+        vec![song("existing")],
+        0,
+        mineral_stats::QueueContext::Manual,
+    )?;
+    assert_eq!(
+        core.replace_queue(Vec::new(), 0, mineral_stats::QueueContext::Unknown),
+        Err(mineral_protocol::PlayQueueError::Empty)
+    );
+    assert_eq!(
+        core.replace_queue(vec![song("new")], 1, mineral_stats::QueueContext::Unknown,),
+        Err(mineral_protocol::PlayQueueError::TargetOutOfBounds { target: 1, len: 1 })
+    );
+    core.with_state(|state| {
+        assert_eq!(state.cursor, PlayCursor::InQueue(0));
+        assert_eq!(
+            state.queue.first().map(|song| song.id.value()),
+            Some("existing")
+        );
+        assert!(matches!(
+            state.queue_context,
+            mineral_stats::QueueContext::Manual
+        ));
+    });
+    Ok(())
+}
+
+/// Duplicate SongId 仍按 request-local target occurrence 起播，不吸附到 first match。
+#[tokio::test]
+async fn replace_queue_selects_exact_duplicate_occurrence() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    let mut first = song("duplicate");
+    first.name = "first".to_owned();
+    let mut second = song("duplicate");
+    second.name = "second".to_owned();
+    let selected =
+        core.replace_queue(vec![first, second], 1, mineral_stats::QueueContext::Unknown)?;
+    assert_eq!(selected.name, "second");
+    core.with_state(|state| {
+        assert_eq!(state.cursor, PlayCursor::InQueue(1));
+        assert_eq!(
+            state.queue.get(1).map(|song| song.name.as_str()),
+            Some("second")
+        );
+    });
+    Ok(())
+}
+
+/// Shuffle 先摘出 exact target occurrence，再洗其余项并把 target 放到 queue[0]。
+#[tokio::test]
+async fn replace_queue_shuffle_keeps_exact_target_occurrence() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    core.set_play_mode(PlayMode::Shuffle, mineral_stats::Actor::User);
+    let mut first = song("duplicate");
+    first.name = "first".to_owned();
+    let mut second = song("duplicate");
+    second.name = "second".to_owned();
+    let selected =
+        core.replace_queue(vec![first, second], 1, mineral_stats::QueueContext::Unknown)?;
+    assert_eq!(selected.name, "second");
+    core.with_state(|state| {
+        assert_eq!(state.cursor, PlayCursor::InQueue(0));
+        assert_eq!(
+            state.queue.first().map(|song| song.name.as_str()),
+            Some("second")
+        );
+        assert_eq!(
+            state
+                .original_queue
+                .as_ref()
+                .and_then(|queue| queue.get(1))
+                .map(|song| song.name.as_str()),
+            Some("second"),
+            "original_queue 保留提交顺序"
+        );
+    });
+    Ok(())
+}
+
+/// play_song 清旧上下文 + 写新 current_song,必须推进 current_version。
+#[tokio::test]
+async fn play_song_bumps_current_version() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    let v0 = core.sync(PlayerVersions::default()).versions.current;
+    core.play_song(
+        &song("a"),
+        mineral_stats::PlayOrigin::Explicit,
+        mineral_stats::Actor::User,
+    );
+    let v1 = core.sync(PlayerVersions::default()).versions.current;
+    assert_eq!(v1, v0.next());
+    Ok(())
+}
+
+/// 回归:play_song 落地时,若游标已精确指向本曲(顺序推进入口预置好),
+/// 不得再按身份 first-match 回溯——否则重复曲会把下标拽回首个副本。
+#[tokio::test]
+async fn play_song_keeps_preset_queue_sel_on_duplicate() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    core.with_state(|st| {
+        st.queue = vec![song("a"), song("b"), song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(2); // 第二个 a
+        st.current_song = Some(song("a"));
+    });
+    core.play_song(
+        &song("a"),
+        mineral_stats::PlayOrigin::Explicit,
+        mineral_stats::Actor::User,
+    );
+    core.with_state(|st| {
+        assert_eq!(
+            st.cursor,
+            PlayCursor::InQueue(2),
+            "已预置的精确下标须保留,不能吸附到 a@0"
+        );
+    });
+    Ok(())
+}
+
+/// play_song 的身份定位仍在:游标未指向目标曲时,按 first-match 重新定位。
+#[tokio::test]
+async fn play_song_locates_when_not_preset() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    core.with_state(|st| {
+        st.queue = vec![song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(0);
+        st.current_song = Some(song("a"));
+    });
+    core.play_song(
+        &song("b"),
+        mineral_stats::PlayOrigin::Explicit,
+        mineral_stats::Actor::User,
+    );
+    core.with_state(|st| {
+        assert_eq!(
+            st.cursor,
+            PlayCursor::InQueue(1),
+            "点播未在位的曲应重新定位"
+        );
+    });
+    Ok(())
+}
+
+/// LyricsReady 命中当前歌写入歌词 → bump;不命中丢弃 → 不 bump。
+#[tokio::test]
+async fn lyrics_ready_bumps_only_on_store() -> color_eyre::Result<()> {
+    let core = core_with(Arc::default())?;
+    core.with_state(|st| st.current_song = Some(song("a")));
+    let v0 = core.sync(PlayerVersions::default()).versions.current;
+
+    core.handle_lyrics_ready(&SongId::new(SourceKind::NETEASE, "x"), Lyrics::default());
+    let v1 = core.sync(PlayerVersions::default()).versions.current;
+    assert_eq!(v1, v0, "非当前歌的歌词被丢弃,不应 bump");
+
+    core.handle_lyrics_ready(&SongId::new(SourceKind::NETEASE, "a"), Lyrics::default());
+    let v2 = core.sync(PlayerVersions::default()).versions.current;
+    assert_eq!(v2, v0.next(), "命中当前歌写入歌词应 bump");
+    Ok(())
+}
+
+/// apply_play_mode:两个非 Shuffle 模式间切换不动队列、不设 original。
+#[test]
+fn apply_between_non_shuffle_keeps_queue() {
+    let mut st = state_with(&["a", "b", "c"], 1, PlayMode::Sequential);
+    apply_play_mode(&mut st, PlayMode::RepeatAll);
+    assert_eq!(st.play_mode, PlayMode::RepeatAll);
+    assert_eq!(ids(&st.queue), vec!["a", "b", "c"]);
+    assert!(st.original_queue.is_none());
+
+    apply_play_mode(&mut st, PlayMode::RepeatOne);
+    assert_eq!(ids(&st.queue), vec!["a", "b", "c"]);
+    assert!(st.original_queue.is_none());
+}
+
+/// 进入档位随 current 段外发:`n` / `p` 各自作数,直接改播(点播)记随机访问。
+#[tokio::test]
+async fn sync_reports_advance_kind() -> color_eyre::Result<()> {
+    let calls = Arc::new(Mutex::new(Vec::<(SongId, bool, u64)>::new()));
+    let core = core_with(calls)?;
+    {
+        let mut st = core.inner.state.lock();
+        st.queue = vec![song("a"), song("b"), song("c")];
+        st.cursor = PlayCursor::InQueue(1);
+        st.current_song = Some(song("b"));
+        st.play_mode = PlayMode::Sequential;
+    }
+    let advance_of = |st: &mut State| {
+        st.sync(PlayerVersions::default())
+            .current
+            .and_then(|c| c.advance)
+    };
+
+    core.next_song(mineral_stats::Actor::User);
+    drain_spawned().await;
+    assert_eq!(
+        core.with_state(advance_of),
+        Some(AdvanceKind::Next),
+        "n 应记成下一首推进"
+    );
+
+    // 测试里播放位置为 0(≤ `prev_restart_threshold_ms`)→ `p` 真正后退到上一首。
+    core.prev_or_restart(mineral_stats::Actor::User);
+    drain_spawned().await;
+    assert_eq!(
+        core.with_state(advance_of),
+        Some(AdvanceKind::Prev),
+        "p 应记成上一首推进"
+    );
+
+    // 直接改播队列里的另一首:跳过顺序,记随机访问。
+    core.play_song(
+        &song("c"),
+        mineral_stats::PlayOrigin::Explicit,
+        mineral_stats::Actor::User,
+    );
+    drain_spawned().await;
+    assert_eq!(
+        core.with_state(advance_of),
+        Some(AdvanceKind::RandomAccess),
+        "点播应记随机访问"
+    );
+    Ok(())
+}
+
+/// next_song(手动跳过):对刚播完的旧歌打 `(old_id, false, position_ms)` 点。
+#[tokio::test]
+async fn next_song_records_skip_for_old_song() -> color_eyre::Result<()> {
+    let calls = Arc::new(Mutex::new(Vec::<(SongId, bool, u64)>::new()));
+    let core = core_with(calls.clone())?;
+    {
+        let mut st = core.inner.state.lock();
+        st.queue = vec![song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(0);
+        st.current_song = Some(song("a"));
+        st.play_mode = PlayMode::Sequential;
+    }
+    core.next_song(mineral_stats::Actor::User);
+    drain_spawned().await;
+
+    let recorded = calls.lock().clone();
+    assert_eq!(recorded.len(), 1, "应只对旧歌打一次跳过点");
+    let (id, completed, _listen) = recorded
+        .first()
+        .cloned()
+        .unwrap_or_else(|| (SongId::new(SourceKind::NETEASE, "missing"), true, u64::MAX));
+    assert_eq!(id, song("a").id);
+    assert!(!completed, "手动跳过应记 completed=false");
+    Ok(())
+}
+
+/// next_song:队尾(Sequential)无下一首时不切歌,也不打点。
+#[tokio::test]
+async fn next_song_at_end_records_nothing() -> color_eyre::Result<()> {
+    let calls = Arc::new(Mutex::new(Vec::<(SongId, bool, u64)>::new()));
+    let core = core_with(calls.clone())?;
+    {
+        let mut st = core.inner.state.lock();
+        st.queue = vec![song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(1);
+        st.current_song = Some(song("b"));
+        st.play_mode = PlayMode::Sequential;
+    }
+    core.next_song(mineral_stats::Actor::User);
+    drain_spawned().await;
+
+    assert!(calls.lock().is_empty(), "队尾无下一首,不应打点");
+    Ok(())
+}
+
+/// prev_or_restart:进度 ≤ 阈值真正切到上一首 → 打 `(old_id, false, _)` 点。
+#[tokio::test]
+async fn prev_below_threshold_records_skip() -> color_eyre::Result<()> {
+    let calls = Arc::new(Mutex::new(Vec::<(SongId, bool, u64)>::new()));
+    let core = core_with(calls.clone())?;
+    {
+        let mut st = core.inner.state.lock();
+        st.queue = vec![song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(1);
+        st.current_song = Some(song("b"));
+        st.play_mode = PlayMode::Sequential;
+    }
+    // ForceNull 起步 position_ms == 0,< 阈值,走「跳上一首」分支。
+    core.prev_or_restart(mineral_stats::Actor::User);
+    drain_spawned().await;
+
+    let recorded = calls.lock().clone();
+    assert_eq!(recorded.len(), 1, "应对旧歌打一次跳过点");
+    let (id, completed, _listen) = recorded
+        .first()
+        .cloned()
+        .unwrap_or_else(|| (SongId::new(SourceKind::NETEASE, "missing"), true, u64::MAX));
+    assert_eq!(id, song("b").id);
+    assert!(!completed, "上一首跳过应记 completed=false");
+    Ok(())
+}
+
+/// play_mode_str:各档落地为稳定 Debug 名。
+#[test]
+fn play_mode_str_is_debug_name() {
+    assert_eq!(PlayMode::Sequential.name(), "Sequential");
+    assert_eq!(PlayMode::Shuffle.name(), "Shuffle");
+    assert_eq!(PlayMode::RepeatAll.name(), "RepeatAll");
+    assert_eq!(PlayMode::RepeatOne.name(), "RepeatOne");
+}

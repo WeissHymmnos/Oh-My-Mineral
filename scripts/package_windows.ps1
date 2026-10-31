@@ -8,18 +8,18 @@ $ZipOut = Join-Path $Dist "Mineral-0.1.0-win64.zip"
 
 Set-Location $Root
 
-Write-Host "==> Building Mineral GUI (--release) for Windows..."
-cargo build -p mineral-gui-qt --release
+Write-Host "==> Building Mineral GUI & Bridge/Daemon (--release) for Windows..."
+cargo build -p mineral-gui-qt -p mineral-gui-bridge --release
 
 if (Test-Path $PkgDir) { Remove-Item -Recurse -Force $PkgDir }
 New-Item -ItemType Directory -Force -Path $PkgDir | Out-Null
 
 Copy-Item "target\release\mineral-gui-qt.exe" (Join-Path $PkgDir "mineral-gui-qt.exe")
-if (Test-Path "target\release\mineral-gui-bridge.exe") {
-    Copy-Item "target\release\mineral-gui-bridge.exe" (Join-Path $PkgDir "mineral-gui-bridge.exe")
-}
+Copy-Item "target\release\mineral-gui-bridge.exe" (Join-Path $PkgDir "mineral-gui-bridge.exe")
 if (Test-Path "$env:USERPROFILE\.cargo\bin\mineral.exe") {
     Copy-Item "$env:USERPROFILE\.cargo\bin\mineral.exe" (Join-Path $PkgDir "mineral.exe")
+} else {
+    Copy-Item "target\release\mineral-gui-bridge.exe" (Join-Path $PkgDir "mineral.exe")
 }
 Copy-Item "assets\logo.ico" (Join-Path $PkgDir "mineral-gui.ico")
 Copy-Item "README.md" (Join-Path $PkgDir "README.md")

@@ -1,0 +1,199 @@
+//! Unix socket 承载:bincode + length-delimited framing 的 adapter。
+
+use async_trait::async_trait;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+
+#[cfg(unix)]
+type RawStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type RawStream = tokio::net::TcpStream;
+
+use crate::{CodecError, Framed, MessageBatch, framed};
+
+use super::{Wire, WireError, WireSink, WireSource};
+
+/// IPC socket 上的会话承载。
+pub struct SocketWire {
+    /// 已建立的双向 framed 连接。
+    conn: Framed<RawStream>,
+}
+
+impl SocketWire {
+    /// 连接 daemon socket(不做握手;握手是会话层的事)。
+    ///
+    /// # Params:
+    ///   - `path`: daemon socket 路径
+    ///
+    /// # Errors
+    /// 连接失败(保留 `ErrorKind` 供不可达判定)。
+    pub async fn connect(path: &std::path::Path) -> Result<Self, WireError> {
+        #[cfg(unix)]
+        let stream = RawStream::connect(path)
+            .await
+            .map_err(|source| WireError::Io {
+                operation: "连接 socket",
+                source,
+            })?;
+        #[cfg(windows)]
+        let stream = {
+            let raw_addr = std::fs::read_to_string(path).map_err(|source| WireError::Io {
+                operation: "连接 socket",
+                source,
+            })?;
+            let addr = raw_addr.trim();
+            let target = if addr.is_empty() { "127.0.0.1:38491" } else { addr };
+            let s = RawStream::connect(target)
+                .await
+                .map_err(|source| WireError::Io {
+                    operation: "连接 socket",
+                    source,
+                })?;
+            let _ = s.set_nodelay(true);
+            s
+        };
+        Ok(Self {
+            conn: framed(stream),
+        })
+    }
+
+    /// 包一条已连接的流(测试 / 已握有 socket 的场景)。
+    ///
+    /// # Params:
+    ///   - `stream`: 已连接的流
+    #[must_use]
+    pub fn from_stream(stream: RawStream) -> Self {
+        Self {
+            conn: framed(stream),
+        }
+    }
+}
+
+#[async_trait]
+impl Wire for SocketWire {
+    async fn send(&mut self, batch: MessageBatch) -> Result<(), WireError> {
+        self.conn
+            .send(encode_batch(&batch)?)
+            .await
+            .map_err(send_wire_error)
+    }
+
+    async fn recv(&mut self) -> Result<Option<MessageBatch>, WireError> {
+        let Some(frame) = self.conn.next().await else {
+            return Ok(None);
+        };
+        let frame = frame.map_err(receive_wire_error)?;
+        Ok(Some(decode_batch(&frame)?))
+    }
+
+    async fn close(&mut self) -> Result<(), WireError> {
+        self.conn.close().await.map_err(|source| WireError::Io {
+            operation: "关闭 socket",
+            source,
+        })
+    }
+
+    fn split(self: Box<Self>) -> (Box<dyn WireSink>, Box<dyn WireSource>) {
+        let (sink, stream) = self.conn.split();
+        (
+            Box::new(SocketSink { sink }),
+            Box::new(SocketSource { stream }),
+        )
+    }
+}
+
+/// socket 承载的发送半。
+struct SocketSink {
+    /// framed 写半。
+    sink: SplitSink<Framed<RawStream>, bytes::Bytes>,
+}
+
+#[async_trait]
+impl WireSink for SocketSink {
+    async fn send(&mut self, batch: MessageBatch) -> Result<(), WireError> {
+        self.sink
+            .send(encode_batch(&batch)?)
+            .await
+            .map_err(send_wire_error)
+    }
+
+    async fn close(&mut self) -> Result<(), WireError> {
+        self.sink.close().await.map_err(|source| WireError::Io {
+            operation: "关闭 socket",
+            source,
+        })
+    }
+}
+
+/// socket 承载的接收半。
+struct SocketSource {
+    /// framed 读半。
+    stream: SplitStream<Framed<RawStream>>,
+}
+
+#[async_trait]
+impl WireSource for SocketSource {
+    async fn recv(&mut self) -> Result<Option<MessageBatch>, WireError> {
+        let Some(frame) = self.stream.next().await else {
+            return Ok(None);
+        };
+        let frame = frame.map_err(receive_wire_error)?;
+        Ok(Some(decode_batch(&frame)?))
+    }
+}
+
+/// 将 socket 读取失败与 codec 帧长超限分别归类。
+fn receive_wire_error(source: std::io::Error) -> WireError {
+    match crate::codec::receive_error(source) {
+        CodecError::Receive(source) => WireError::Io {
+            operation: "读取 socket",
+            source,
+        },
+        source => WireError::Protocol {
+            operation: "读取会话帧",
+            source,
+        },
+    }
+}
+
+/// 将 socket 写入失败与 codec 帧长超限分别归类。
+fn send_wire_error(source: std::io::Error) -> WireError {
+    match crate::codec::send_error(source) {
+        CodecError::Send(source) => WireError::Io {
+            operation: "写入 socket",
+            source,
+        },
+        source => WireError::Protocol {
+            operation: "写入会话帧",
+            source,
+        },
+    }
+}
+
+/// 把一批会话消息编成一帧负载；编解码失败归为协议错误。
+///
+/// # Params:
+///   - `batch`: 待发送消息。
+///
+/// # Errors
+/// bincode 序列化失败。
+fn encode_batch(batch: &MessageBatch) -> Result<bytes::Bytes, WireError> {
+    crate::encode(batch).map_err(|source| WireError::Protocol {
+        operation: "编码会话批",
+        source,
+    })
+}
+
+/// 将已去掉长度前缀的一帧负载解码为会话消息。
+///
+/// # Params:
+///   - `frame`: 一帧负载。
+///
+/// # Errors
+/// bincode 反序列化失败。
+fn decode_batch(frame: &[u8]) -> Result<MessageBatch, WireError> {
+    crate::decode::<MessageBatch>(frame).map_err(|source| WireError::Protocol {
+        operation: "解码会话批",
+        source,
+    })
+}

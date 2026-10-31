@@ -1403,12 +1403,18 @@ QDialog* make_card(const QString& title, const QString& placeholder, QLineEdit**
 QString find_mineral_binary() {
 #ifdef Q_OS_WIN
     const QString exe_name = QStringLiteral("mineral.exe");
+    const QString bridge_name = QStringLiteral("mineral-gui-bridge.exe");
 #else
     const QString exe_name = QStringLiteral("mineral");
+    const QString bridge_name = QStringLiteral("mineral-gui-bridge");
 #endif
     const QString beside_app = QDir(QCoreApplication::applicationDirPath()).filePath(exe_name);
     if (QFileInfo::exists(beside_app)) {
         return beside_app;
+    }
+    const QString bridge_beside = QDir(QCoreApplication::applicationDirPath()).filePath(bridge_name);
+    if (QFileInfo::exists(bridge_beside)) {
+        return bridge_beside;
     }
     const QString in_path = QStandardPaths::findExecutable(QStringLiteral("mineral"));
     if (!in_path.isEmpty()) {

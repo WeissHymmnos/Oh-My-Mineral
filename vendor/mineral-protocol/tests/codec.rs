@@ -1,0 +1,504 @@
+//! 端到端 codec 测试:在 in-memory `DuplexStream` 上 framed → send → recv → 反序列化。
+
+use color_eyre::eyre::eyre;
+use mineral_audio::AudioSnapshot;
+use mineral_model::{BitRate, PlaylistId, SongId, SourceKind};
+use mineral_protocol::{
+    AdvanceKind, CurrentSync, DownloadId, DownloadOrigin, DownloadStatus, DownloadSummary,
+    DownloadTarget, DownloadWave, FailureKind, OperationFailure, PlayMode, PlayerSync,
+    PlayerVersions, QueueSync, Request, Response, SegmentVersion, SongDownloadView, SongStatsWire,
+    StoreValue, framed, recv, send,
+};
+use mineral_task::{ChannelFetchKind, Priority, TaskKind};
+use mineral_test::song;
+use pretty_assertions::assert_eq;
+use tokio::io::duplex;
+
+/// 同一值经 serde_json 往返,断言 Debug 保真。codec 可换的守卫(会话层同类守卫见
+/// tests/session_codec.rs):wire 类型只许依赖 serde derive,不许绑死
+/// bincode。framed bincode 路径由调用方覆盖。
+fn json_round_trips<T>(value: &T) -> color_eyre::Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    let want = format!("{value:?}");
+    let json = serde_json::to_string(value)?;
+    let back: T = serde_json::from_str(&json)?;
+    assert_eq!(format!("{back:?}"), want, "JSON 往返应保真");
+    Ok(())
+}
+
+/// 把一个 [`Request`] 走 framed round-trip,断言收回的与发出的 Debug 等价
+/// (`Request` 不实现 `PartialEq`,但成功反序列化的 Debug 必然逐字段相同);
+/// 同一值顺带过 [`json_round_trips`](双 codec 一次覆盖)。
+async fn req_round_trips(req: Request) -> color_eyre::Result<()> {
+    json_round_trips(&req)?;
+    let (a, b) = duplex(64 * 1024);
+    let mut sender = framed(a);
+    let mut receiver = framed(b);
+    let want = format!("{req:?}");
+    send(&mut sender, &req).await?;
+    let got: Request = recv(&mut receiver)
+        .await?
+        .ok_or_else(|| eyre!("frame missing"))?;
+    assert_eq!(format!("{got:?}"), want);
+    Ok(())
+}
+
+/// 同 [`req_round_trips`],任意 serde 载荷版(会话更新载荷等)。
+async fn value_round_trips<T>(value: T) -> color_eyre::Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    json_round_trips(&value)?;
+    let (a, b) = duplex(64 * 1024);
+    let mut sender = framed(a);
+    let mut receiver = framed(b);
+    let want = format!("{value:?}");
+    send(&mut sender, &value).await?;
+    let got: T = recv(&mut receiver)
+        .await?
+        .ok_or_else(|| eyre!("frame missing"))?;
+    assert_eq!(format!("{got:?}"), want);
+    Ok(())
+}
+
+/// 同 [`req_round_trips`],[`Response`] 版。
+async fn resp_round_trips(resp: Response) -> color_eyre::Result<()> {
+    json_round_trips(&resp)?;
+    let (a, b) = duplex(64 * 1024);
+    let mut sender = framed(a);
+    let mut receiver = framed(b);
+    let want = format!("{resp:?}");
+    send(&mut sender, &resp).await?;
+    let got: Response = recv(&mut receiver)
+        .await?
+        .ok_or_else(|| eyre!("frame missing"))?;
+    assert_eq!(format!("{got:?}"), want);
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_trip_request_submit_task() -> color_eyre::Result<()> {
+    let (a, b) = duplex(64 * 1024);
+    let mut sender = framed(a);
+    let mut receiver = framed(b);
+
+    let kind = TaskKind::ChannelFetch(ChannelFetchKind::Lyrics {
+        song_id: SongId::new(SourceKind::NETEASE, "12345"),
+    });
+    let req = Request::SubmitTask(kind.clone(), Priority::User);
+    json_round_trips(&req)?;
+    send(&mut sender, &req).await?;
+    let got: Request = recv(&mut receiver)
+        .await?
+        .ok_or_else(|| eyre!("frame missing"))?;
+    if let Request::SubmitTask(k, p) = got {
+        assert_eq!(k, kind);
+        assert_eq!(p, Priority::User);
+    } else {
+        return Err(eyre!("unexpected variant: {got:?}"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_trip_response_playback_payload() -> color_eyre::Result<()> {
+    let snap = AudioSnapshot {
+        output: None,
+        playing: true,
+        position_ms: 12_345,
+        duration_ms: Some(200_000),
+        volume_pct: 77,
+        track_finished_seq: 3,
+        backend: mineral_audio::AudioBackend::Null,
+        buffered_bps: mineral_audio::Bps::new(4_200),
+        // gapless 字段给辨识度非默认值,roundtrip 等值断言覆盖到它们(bincode 位置式,守住没被 skip)。
+        current_track_token: 9,
+        next_duration_ms: Some(180_000),
+        next_buffered_bps: mineral_audio::Bps::new(6_000),
+        next_ready: true,
+        sample_rate_hz: 44_100,
+    };
+    value_round_trips(mineral_protocol::UpdatePayload::Playback(Box::new(snap))).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_trip_response_error() -> color_eyre::Result<()> {
+    let (a, b) = duplex(64 * 1024);
+    let mut sender = framed(a);
+    let mut receiver = framed(b);
+
+    let msg = "request failed: channel unavailable";
+    let resp = Response::Error(OperationFailure {
+        kind: FailureKind::Unavailable,
+        detail: msg.to_owned(),
+    });
+    json_round_trips(&resp)?;
+    send(&mut sender, &resp).await?;
+    let got: Response = recv(&mut receiver)
+        .await?
+        .ok_or_else(|| eyre!("frame missing"))?;
+    if let Response::Error(failure) = got {
+        assert_eq!(failure.kind, FailureKind::Unavailable);
+    } else {
+        return Err(eyre!("unexpected variant: {got:?}"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn req_resp_pair_over_one_stream() -> color_eyre::Result<()> {
+    // 模拟同一条 socket 上 client 发 Request → server 收 → server 发 Response → client 收。
+    let (client_side, server_side) = duplex(64 * 1024);
+    let mut client = framed(client_side);
+    let mut server = framed(server_side);
+
+    send(&mut client, &Request::DaemonInfo).await?;
+    let req: Request = recv(&mut server)
+        .await?
+        .ok_or_else(|| eyre!("server got nothing"))?;
+    assert!(matches!(req, Request::DaemonInfo));
+
+    send(&mut server, &Response::DaemonInfo { pid: 4242 }).await?;
+    let resp: Response = recv(&mut client)
+        .await?
+        .ok_or_else(|| eyre!("client got nothing"))?;
+    assert!(matches!(resp, Response::DaemonInfo { pid: 4242 }));
+    Ok(())
+}
+
+/// 简单 / 单元 Request variant 的 round-trip(无 payload 或标量 payload)。
+#[tokio::test]
+async fn round_trip_simple_requests() -> color_eyre::Result<()> {
+    req_round_trips(Request::Pause).await?;
+    req_round_trips(Request::Resume).await?;
+    req_round_trips(Request::Stop).await?;
+    req_round_trips(Request::Seek(12_345)).await?;
+    req_round_trips(Request::SetVolume(50)).await?;
+    req_round_trips(Request::CyclePlayMode).await?;
+    req_round_trips(Request::SetPlayMode(PlayMode::RepeatOne)).await?;
+    req_round_trips(Request::PrevOrRestart).await?;
+    req_round_trips(Request::NextSong).await?;
+    req_round_trips(Request::Shutdown).await?;
+    Ok(())
+}
+
+/// store 读写的 round-trip。
+#[tokio::test]
+async fn round_trip_store() -> color_eyre::Result<()> {
+    let id = SongId::new(SourceKind::NETEASE, "31");
+    req_round_trips(Request::StoreGet {
+        song: id.clone(),
+        key: "plugin.x".to_owned(),
+    })
+    .await?;
+    req_round_trips(Request::StoreSet {
+        song: id.clone(),
+        key: "plugin.x".to_owned(),
+        value: StoreValue::Text("值".to_owned()),
+    })
+    .await?;
+    resp_round_trips(Response::StoreValue(StoreValue::Real(2.5))).await?;
+    resp_round_trips(Response::StoreValue(StoreValue::Nil)).await?;
+
+    Ok(())
+}
+
+/// 带 Song payload 的 Request:PlaySong / atomic PlayQueue。
+#[tokio::test]
+async fn round_trip_song_payload_requests() -> color_eyre::Result<()> {
+    req_round_trips(Request::PlaySong(Box::new(song("s1")))).await?;
+    req_round_trips(Request::PlayQueue {
+        songs: vec![song("s1"), song("s2")],
+        target: 1,
+        context: mineral_protocol::QueueContextWire::Search {
+            query: "李志".to_owned(),
+        },
+    })
+    .await?;
+    resp_round_trips(Response::PlayQueue(Ok(()))).await?;
+    resp_round_trips(Response::PlayQueue(Err(
+        mineral_protocol::PlayQueueError::TargetOutOfBounds { target: 2, len: 2 },
+    )))
+    .await?;
+    Ok(())
+}
+
+/// love / 统计相关 Request 与 Response 的 round-trip。
+#[tokio::test]
+async fn round_trip_love_and_stats() -> color_eyre::Result<()> {
+    req_round_trips(Request::ToggleLove(Box::new(song("123")))).await?;
+    req_round_trips(Request::QuerySongStats(SongId::new(
+        SourceKind::NETEASE,
+        "123",
+    )))
+    .await?;
+    resp_round_trips(Response::LoveToggled(true)).await?;
+    resp_round_trips(Response::SongStats(Some(SongStatsWire {
+        play_count: 3,
+        skip_count: 1,
+        total_listen_ms: 500_000,
+        last_played_at: Some(1_700_000_000_000),
+        loved: true,
+    })))
+    .await?;
+    resp_round_trips(Response::SongStats(None)).await?;
+    Ok(())
+}
+
+/// 双重段齐发(Shuffle + original_queue + current)的 PlayerSync 完整往返。
+#[tokio::test]
+async fn round_trip_player_sync_rich() -> color_eyre::Result<()> {
+    let sync = PlayerSync {
+        versions: PlayerVersions {
+            queue: SegmentVersion::new(4),
+            current: SegmentVersion::new(9),
+        },
+        cursor: mineral_protocol::PlayCursor::InQueue(1),
+        play_mode: PlayMode::Shuffle,
+        play_origin: None,
+        queue: Some(QueueSync {
+            queue: vec![song("a"), song("b"), song("c")],
+            original_queue: Some(vec![song("a"), song("b"), song("c")]),
+        }),
+        current: Some(CurrentSync {
+            current_song: Some(song("b")),
+            direct_media: None,
+            media_info: None,
+            current_lyrics: None,
+            current_lyrics_song_id: None,
+            // 包络随 current 段上线:points 字节与算法版本不变形。
+            current_envelope: Some(mineral_model::Envelope {
+                points: vec![0, 128, 255],
+                version: 1,
+            }),
+            // 进入档位随 current 段上线。
+            advance: Some(AdvanceKind::Prev),
+        }),
+    };
+    value_round_trips(mineral_protocol::UpdatePayload::Player {
+        sync: Box::new(sync),
+        queue_parts: 0,
+    })
+    .await?;
+    Ok(())
+}
+
+/// 轻段-only(版本一致,两重段缺席)的 PlayerSync 往返:稳态 tick 的主路径。
+#[tokio::test]
+async fn round_trip_player_sync_light_only() -> color_eyre::Result<()> {
+    let sync = PlayerSync {
+        versions: PlayerVersions {
+            queue: SegmentVersion::new(4),
+            current: SegmentVersion::new(9),
+        },
+        cursor: mineral_protocol::PlayCursor::InQueue(2),
+        play_mode: PlayMode::RepeatAll,
+        play_origin: None,
+        queue: None,
+        current: None,
+    };
+    value_round_trips(mineral_protocol::UpdatePayload::Player {
+        sync: Box::new(sync),
+        queue_parts: 0,
+    })
+    .await?;
+    Ok(())
+}
+
+/// 属性测试:随机 `Request` 经 bincode 编/解码 Debug 恒等。覆盖手写 example 测不到的
+/// 字段组合(尤其 Song-laden 的 PlaySong / PlayQueue)。framing(length-delimited)是上游
+/// codec,不在此重测;序列化保真才是本仓的风险点。
+mod proptests {
+    use bincode::{deserialize, serialize};
+    use mineral_model::{SongId, SourceKind};
+    use mineral_protocol::Request;
+    use mineral_test::arb_song;
+    use proptest::collection::vec;
+    use proptest::prelude::{Just, Strategy, any, prop_oneof, proptest};
+    use proptest::test_runner::TestCaseError;
+
+    /// 随机 `Request`:unit variant + 数值 variant + Song-laden variant。
+    fn arb_request() -> impl Strategy<Value = Request> {
+        prop_oneof![
+            Just(Request::Pause),
+            Just(Request::Resume),
+            Just(Request::Stop),
+            Just(Request::CyclePlayMode),
+            Just(Request::PrevOrRestart),
+            Just(Request::NextSong),
+            Just(Request::Shutdown),
+            any::<u64>().prop_map(Request::Seek),
+            any::<u8>().prop_map(Request::SetVolume),
+            arb_song().prop_map(|s| Request::PlaySong(Box::new(s))),
+            (vec(arb_song(), 0..4), any::<usize>()).prop_map(|(songs, target)| {
+                Request::PlayQueue {
+                    songs,
+                    target,
+                    context: mineral_protocol::QueueContextWire::Unknown,
+                }
+            }),
+            arb_song().prop_map(|s| Request::ToggleLove(Box::new(s))),
+            any::<String>().prop_map(|s| Request::QuerySongStats(SongId::new(
+                SourceKind::NETEASE,
+                s.as_str()
+            ))),
+        ]
+    }
+
+    proptest! {
+        /// 任意 `Request` 经 bincode 往返后 Debug 恒等(`Request` 无 `PartialEq`,沿用 Debug 比较)。
+        #[test]
+        fn request_bincode_roundtrip(req in arb_request()) {
+            let bytes = serialize(&req).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let back: Request = deserialize(&bytes).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            proptest::prop_assert_eq!(format!("{back:?}"), format!("{req:?}"));
+        }
+
+        /// 任意 `Request` 经 JSON 往返后 Debug 恒等(codec 可换守卫,与 bincode 版共用 arb)。
+        #[test]
+        fn request_json_roundtrip(req in arb_request()) {
+            let json = serde_json::to_string(&req).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let back: Request = serde_json::from_str(&json).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            proptest::prop_assert_eq!(format!("{back:?}"), format!("{req:?}"));
+        }
+    }
+}
+
+/// 搜索任务 / 歌单写操作 / 队列插播 / caps 请求的 round-trip
+/// (新消息覆盖:bincode 位置式编码,字段增减会在这里炸出来)。
+#[tokio::test]
+async fn round_trip_search_write_queue_caps() -> color_eyre::Result<()> {
+    req_round_trips(Request::SubmitTask(
+        TaskKind::ChannelFetch(ChannelFetchKind::Search {
+            source: SourceKind::NETEASE,
+            kind: mineral_model::SearchKind::Artist,
+            query: String::from("海阔天空"),
+            page: mineral_channel_core::Page::new(30, 30),
+        }),
+        Priority::User,
+    ))
+    .await?;
+    req_round_trips(Request::SubmitTask(
+        TaskKind::PlaylistWrite(mineral_task::PlaylistWriteOp::AddSongs {
+            id: PlaylistId::new(SourceKind::NETEASE, "123"),
+            songs: vec![SongId::new(SourceKind::NETEASE, "186016")],
+        }),
+        Priority::User,
+    ))
+    .await?;
+    req_round_trips(Request::QueueInsertNext {
+        songs: vec![song("ins1"), song("ins2"), song("ins1")],
+        context: mineral_protocol::QueueContextWire::Manual,
+    })
+    .await?;
+    req_round_trips(Request::QueueAppend {
+        songs: vec![song("app1"), song("app2"), song("app1")],
+        context: mineral_protocol::QueueContextWire::Search {
+            query: "q".to_owned(),
+        },
+    })
+    .await?;
+    req_round_trips(Request::ChannelCaps).await?;
+    resp_round_trips(Response::ChannelCaps(vec![(
+        SourceKind::NETEASE,
+        mineral_channel_core::ChannelCaps::builder()
+            .searchable(vec![
+                mineral_model::SearchKind::Song,
+                mineral_model::SearchKind::Artist,
+            ])
+            .playlist_edit(true)
+            .artist_sections(mineral_channel_core::ArtistSections::new(vec![
+                mineral_channel_core::ArtistSectionKind::TopSongs,
+                mineral_channel_core::ArtistSectionKind::Albums,
+            ]))
+            .build(),
+    )]))
+    .await?;
+    Ok(())
+}
+
+/// 下载、进程信息、复制模板与终端上报必须同时通过 JSON 和 bincode round-trip。
+#[tokio::test]
+async fn round_trip_download_info_copy_terminal() -> color_eyre::Result<()> {
+    req_round_trips(Request::DaemonInfo).await?;
+    resp_round_trips(Response::DaemonInfo { pid: 4242 }).await?;
+
+    req_round_trips(Request::Download(DownloadTarget::Song(Box::new(song(
+        "dl",
+    )))))
+    .await?;
+    req_round_trips(Request::Download(DownloadTarget::Playlist(
+        PlaylistId::new(SourceKind::NETEASE, "p1"),
+    )))
+    .await?;
+    let download_id = DownloadId::new("download-1".to_owned());
+    let download_view = SongDownloadView {
+        id: download_id.clone(),
+        song: Box::new(song("dl-view")),
+        origin: DownloadOrigin::Direct,
+        status: DownloadStatus::Downloading,
+        quality: BitRate::Lossless,
+        bytes_done: 1_024,
+        bytes_total: Some(4_096),
+        speed_bps: 512,
+        failure: None,
+    };
+    req_round_trips(Request::StopDownload(download_id)).await?;
+    resp_round_trips(Response::Ok).await?;
+    resp_round_trips(Response::Error(OperationFailure {
+        kind: FailureKind::NotFound,
+        detail: "unknown download identity".to_owned(),
+    }))
+    .await?;
+    value_round_trips(mineral_protocol::UpdatePayload::DownloadsSummary(
+        DownloadSummary {
+            active: 1,
+            queued: 2,
+            preparing_playlists: 1,
+            speed_bps: 512,
+            latest_wave: Some(DownloadWave {
+                sequence: 3,
+                downloaded: 5,
+                already_present: 1,
+                skipped_by_hook: 0,
+                failed: 1,
+                stopped: 1,
+            }),
+        },
+    ))
+    .await?;
+    value_round_trips(mineral_protocol::UpdatePayload::DownloadsDetailSnapshot(
+        vec![download_view],
+    ))
+    .await?;
+
+    // 服务能力只携带可执行操作名称与采集可用性，不含配置树。
+    req_round_trips(Request::ServiceInfo).await?;
+    resp_round_trips(Response::ServiceInfo(mineral_protocol::ServiceInfo {
+        queue_transforms: vec!["去重".to_owned(), "按艺人排序".to_owned()],
+        play_counts: mineral_protocol::PlayCountAvailability {
+            enabled: true,
+            excluded_sources: vec!["local".to_owned()],
+        },
+    }))
+    .await?;
+    req_round_trips(Request::QueueEdit {
+        op: mineral_protocol::QueueOp::ApplyTransform {
+            name: "去重".to_owned(),
+            selected: Some(2),
+        },
+    })
+    .await?;
+
+    req_round_trips(Request::TerminalState {
+        rows: 50,
+        cols: 200,
+        fullscreen: false,
+        focused: true,
+    })
+    .await?;
+    Ok(())
+}

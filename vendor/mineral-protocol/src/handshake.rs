@@ -1,0 +1,206 @@
+//! 连接建立后的握手帧:版本守门 + 订阅集声明。
+//!
+//! 没有"协议版本协商"——两端同仓同发版,**包版本相等才互通**
+//! ([`PkgVersion::current`],workspace 统一版本,升版自动跟随、无手动 bump)。
+//! 不匹配时 server 回 `accepted == false`,client 提示重启 daemon 后干净退出。
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// 结构化包版本(workspace 统一版本)。两端相等才互通——同仓同发版前提下,
+/// 二进制版本就是协议版本。比较走 `Eq`,人读展示走 `Display`(`0.4.2` 形)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PkgVersion {
+    /// 主版本号。
+    pub major: u16,
+
+    /// 次版本号。
+    pub minor: u16,
+
+    /// 修订号。
+    pub patch: u16,
+}
+
+impl PkgVersion {
+    /// 本端包版本(编译期注入的 `CARGO_PKG_VERSION_{MAJOR,MINOR,PATCH}`)。
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            major: parse_component(env!("CARGO_PKG_VERSION_MAJOR")),
+            minor: parse_component(env!("CARGO_PKG_VERSION_MINOR")),
+            patch: parse_component(env!("CARGO_PKG_VERSION_PATCH")),
+        }
+    }
+
+    /// 与对端版本是否互通。**1.0 前不守 SemVer**——必须完全相等;
+    /// **1.0 起按 SemVer**——主版本相同即互通(同 major 内协议向后兼容)。
+    #[must_use]
+    pub fn compatible_with(self, other: Self) -> bool {
+        if self.major == 0 || other.major == 0 {
+            self == other
+        } else {
+            self.major == other.major
+        }
+    }
+}
+
+impl std::fmt::Display for PkgVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// 解析单段版本号。cargo 保证 `CARGO_PKG_VERSION_*` 是十进制数,失败分支
+/// 理论不可达,回 0 兜底(守卫测试钉住 `current() != 0.0.0`)。
+fn parse_component(s: &str) -> u16 {
+    s.parse().unwrap_or(0)
+}
+
+/// client → server 握手首帧(连接建立后第一帧,先于任何请求)。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientInfo {
+    /// client 的包版本(构造经 [`ClientInfo::new`] 自动填 [`PkgVersion::current`])。
+    pub version: PkgVersion,
+
+    /// client 实现的自报名(如 `tui` / `cli`;开放命名空间,新 client 形态
+    /// 自取名即可)。daemon 不据此分派任何行为,只作观测归属。
+    pub name: String,
+}
+
+impl ClientInfo {
+    /// 以本端包版本构造握手帧。
+    ///
+    /// # Params:
+    ///   - `name`: client 实现的自报名(如 `tui` / `cli`)
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            version: PkgVersion::current(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// 对端报的版本与本端是否互通(server 侧守门判定,规则见
+    /// [`PkgVersion::compatible_with`])。
+    #[must_use]
+    pub fn version_matches(&self) -> bool {
+        self.version.compatible_with(PkgVersion::current())
+    }
+}
+
+/// server → client 握手应答。`accepted == false` 时连接随即被 server 关闭,
+/// client 据 [`reason`](Self::reason) 与 [`version`](Self::version) 出人话提示。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServerHello {
+    /// 是否接受本连接。
+    pub accepted: bool,
+
+    /// 拒绝原因;`accepted == true` 时恒 `None`。
+    pub reason: Option<RejectReason>,
+
+    /// server 的包版本(版本错配时 client 用它拼提示)。
+    pub version: PkgVersion,
+}
+
+impl ServerHello {
+    /// 接受连接的应答。
+    #[must_use]
+    pub fn accept() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+            version: PkgVersion::current(),
+        }
+    }
+
+    /// 被接受则 `Ok(())`,被拒则返回结构化拒绝原因(client 侧握手校验的单一入口,
+    /// oneshot 与长连接 client 共用)。
+    ///
+    /// # Errors
+    /// 握手被拒(版本不匹配)。
+    pub fn ensure_accepted(&self) -> Result<(), HandshakeRejected> {
+        if self.accepted {
+            return Ok(());
+        }
+        Err(HandshakeRejected {
+            reason: self.reason,
+            server_version: self.version,
+            client_version: PkgVersion::current(),
+        })
+    }
+
+    /// 拒绝连接的应答。
+    #[must_use]
+    pub fn reject(reason: RejectReason) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason),
+            version: PkgVersion::current(),
+        }
+    }
+}
+
+/// daemon 对握手的结构化拒绝。调用方据 [`Self::reason`] 识别版本错配。
+#[derive(Clone, Debug, Error)]
+#[error("daemon 拒绝连接: {reason:?} (server {server_version}, client {client_version})")]
+pub struct HandshakeRejected {
+    /// daemon 给出的拒绝原因。
+    reason: Option<RejectReason>,
+
+    /// daemon 自报的包版本。
+    server_version: PkgVersion,
+
+    /// 发起握手的 client 包版本。
+    client_version: PkgVersion,
+}
+
+impl HandshakeRejected {
+    /// 返回 daemon 给出的拒绝原因。
+    #[must_use]
+    pub fn reason(&self) -> Option<RejectReason> {
+        self.reason
+    }
+
+    /// 返回 daemon 握手应答的包版本。
+    #[must_use]
+    pub fn server_version(&self) -> PkgVersion {
+        self.server_version
+    }
+
+    /// 返回发起连接的 client 包版本。
+    #[must_use]
+    pub fn client_version(&self) -> PkgVersion {
+        self.client_version
+    }
+}
+
+/// 握手被拒的原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectReason {
+    /// 两端包版本不一致(多见于升级后旧 daemon 仍在跑,重启 daemon 即解)。
+    VersionMismatch,
+}
+
+/// 订阅类别(client 想收哪类 [`Event`](crate::Event),按类别整组订阅)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Subscription {
+    /// 属性变更([`Event::PropertyChanged`](crate::Event::PropertyChanged))。
+    Property,
+
+    /// 通知事件([`Event::Failure`](crate::Event::Failure)、
+    /// [`Event::Toast`](crate::Event::Toast)与按 id 撤销通知)。
+    Toast,
+
+    /// 生命周期事件(曲终 / 下载完成)。
+    Lifecycle,
+
+    /// Daemon 服务能力([`Event::ServiceInfoChanged`](crate::Event::ServiceInfoChanged))；
+    /// 订阅时先重放当前能力，再接收变更。
+    ServiceInfo,
+
+    /// 任务 / 数据事件([`Event::Task`](crate::Event::Task),内置 TUI 订阅)。
+    /// 订阅时握手后先重放当前数据快照(歌单库合并快照 + 各源收藏集)再进实时流;
+    /// 请求-响应类载荷(搜索 / 下钻详情)广播给全部订阅者,client 按自身在途
+    /// 请求配对,配不上的直接丢。
+    Task,
+}

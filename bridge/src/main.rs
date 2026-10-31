@@ -119,15 +119,16 @@ fn cover_of(source: &str, url: &Option<mineral_model::MediaUrl>) -> Option<Strin
         tokio::spawn(async move {
             let _ = tokio::fs::create_dir_all(&sub_dir_clone).await;
             let tmp = sub_dir_clone.join(format!("{hex}.part"));
-            let status = Command::new("curl")
-                .args(["-sL", "--max-time", "8", "-o"])
+            let mut cmd = Command::new("curl");
+            cmd.args(["-sL", "--max-time", "8", "-o"])
                 .arg(&tmp)
                 .arg(&raw)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+                .stderr(Stdio::null());
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000);
+            let status = cmd.status().await;
             if status.is_ok_and(|s| s.success())
                 && tokio::fs::metadata(&tmp).await.is_ok_and(|m| m.len() > 128)
             {
@@ -261,55 +262,56 @@ impl App {
         }
     }
 
+    async fn try_connect_once(&mut self) -> Result<(), String> {
+        let path = socket_path().map_err(|e| format!("无法解析 socket：{e}"))?;
+        let wire = mineral_protocol::SocketWire::connect(&path)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let client = Client::from_wire(Box::new(wire), "mineral-gui", ClientConfig::default())
+            .await
+            .map_err(|e| format!("握手失败：{e}"))?;
+        for topic in [
+            SubscriptionTopic::Player,
+            SubscriptionTopic::Playback,
+            SubscriptionTopic::Tasks,
+            SubscriptionTopic::DownloadsSummary,
+            SubscriptionTopic::DownloadsDetail,
+            SubscriptionTopic::Pcm,
+            SubscriptionTopic::Events(Subscription::Toast),
+            SubscriptionTopic::Events(Subscription::Lifecycle),
+            SubscriptionTopic::Events(Subscription::ServiceInfo),
+            SubscriptionTopic::Events(Subscription::Task),
+        ] {
+            let _ = client.subscribe(topic);
+        }
+        client
+            .wait_subscriptions_ready(Duration::from_secs(2))
+            .await;
+        self.client = Some(client);
+        self.last_player_sig = Value::Null;
+        self.last_downloads_sig = Value::Null;
+        emit(json!({
+            "event": "connection",
+            "connected": true,
+            "message": "已连接 Mineral daemon",
+            "socket": path.display().to_string(),
+        }));
+        self.refresh_caps().await;
+        self.publish();
+        Ok(())
+    }
+
     async fn connect(&mut self) {
-        let path = match socket_path() {
-            Ok(path) => path,
-            Err(error) => {
-                emit(json!({"event":"connection","connected":false,"message":format!("无法解析 socket：{error}")}));
-                return;
+        match self.try_connect_once().await {
+            Ok(()) => {}
+            Err(_error) if self.launched.is_none() => {
+                self.launch_daemon().await;
             }
-        };
-        match mineral_protocol::SocketWire::connect(&path).await {
-            Ok(wire) => match Client::from_wire(Box::new(wire), "mineral-gui", ClientConfig::default()).await {
-                Ok(client) => {
-                    for topic in [
-                        SubscriptionTopic::Player,
-                        SubscriptionTopic::Playback,
-                        SubscriptionTopic::Tasks,
-                        SubscriptionTopic::DownloadsSummary,
-                        SubscriptionTopic::DownloadsDetail,
-                        SubscriptionTopic::Pcm,
-                        SubscriptionTopic::Events(Subscription::Toast),
-                        SubscriptionTopic::Events(Subscription::Lifecycle),
-                        SubscriptionTopic::Events(Subscription::ServiceInfo),
-                        SubscriptionTopic::Events(Subscription::Task),
-                    ] {
-                        let _ = client.subscribe(topic);
-                    }
-                    client
-                        .wait_subscriptions_ready(Duration::from_secs(2))
-                        .await;
-                    self.client = Some(client);
-                    self.last_player_sig = Value::Null;
-                    self.last_downloads_sig = Value::Null;
-                    emit(json!({
-                        "event": "connection",
-                        "connected": true,
-                        "message": "已连接 Mineral daemon",
-                        "socket": path.display().to_string(),
-                    }));
-                    self.refresh_caps().await;
-                    self.publish();
-                }
-                Err(error) => {
-                    emit(json!({"event":"connection","connected":false,"message":format!("握手失败：{error}")}));
-                }
-            },
             Err(error) => {
                 emit(json!({
                     "event": "connection",
                     "connected": false,
-                    "message": format!("Daemon 未连接（{}）。可启动 mineral serve 后重试。", error),
+                    "message": format!("Daemon 未连接（{error}）。可启动 mineral serve 后重试。"),
                 }));
             }
         }
@@ -318,24 +320,31 @@ impl App {
     async fn launch_daemon(&mut self) {
         if let Some(child) = &mut self.launched {
             if matches!(child.try_wait(), Ok(None)) {
-                self.connect().await;
+                if let Err(error) = self.try_connect_once().await {
+                    emit(json!({
+                        "event": "connection",
+                        "connected": false,
+                        "message": format!("Daemon 未连接（{error}）。"),
+                    }));
+                }
                 return;
             }
             self.launched = None;
         }
         let mut candidates = Vec::new();
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            candidates.push(dir.join("mineral"));
-            candidates.push(dir.join("mineral.exe"));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("mineral"));
+                candidates.push(dir.join("mineral.exe"));
+            }
+            candidates.push(exe);
         }
         candidates.push(std::path::PathBuf::from("/usr/bin/mineral"));
         candidates.push(std::path::PathBuf::from("/usr/local/bin/mineral"));
         candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/mineral"));
         candidates.push(std::path::PathBuf::from("mineral"));
         candidates.push(std::path::PathBuf::from("mineral.exe"));
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             let home = std::path::PathBuf::from(home);
             candidates.push(home.join(".cargo/bin/mineral"));
             candidates.push(home.join(".cargo/bin/mineral.exe"));
@@ -350,12 +359,25 @@ impl App {
                 .stderr(Stdio::null());
             #[cfg(unix)]
             cmd.process_group(0);
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000);
             match cmd.spawn() {
                 Ok(child) => {
                     self.launched = Some(child);
                     emit(json!({"event":"notice","level":"info","text":"正在启动 mineral serve"}));
-                    tokio::time::sleep(Duration::from_millis(700)).await;
-                    self.connect().await;
+                    for _ in 0..8 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if self.try_connect_once().await.is_ok() {
+                            return;
+                        }
+                    }
+                    if let Err(error) = self.try_connect_once().await {
+                        emit(json!({
+                            "event": "connection",
+                            "connected": false,
+                            "message": format!("Daemon 未连接（{error}）。"),
+                        }));
+                    }
                     return;
                 }
                 Err(error) => last_error = Some(error),
@@ -1213,8 +1235,268 @@ fn pcm_json(pcm: &[f32]) -> Value {
     json!({"event":"pcm","peaks":peaks,"scope":scope,"rms":rms})
 }
 
-#[tokio::main]
-async fn main() {
+fn netease_config_from(
+    section: &mineral_server::config::NeteaseSection,
+) -> mineral_channel_netease::NeteaseConfig {
+    use mineral_channel_netease::config::{AlbumCacheConfig, PlaylistFetchConfig, RequestsConfig};
+    mineral_channel_netease::NeteaseConfig::builder()
+        .album_cache(
+            AlbumCacheConfig::builder()
+                .ttl_days(*section.album_cache().ttl_days())
+                .ttl_jitter_days(*section.album_cache().ttl_jitter_days())
+                .build(),
+        )
+        .playlist_fetch(
+            PlaylistFetchConfig::builder()
+                .batch_size(*section.playlist_fetch().batch_size())
+                .max_concurrent(*section.playlist_fetch().max_concurrent())
+                .build(),
+        )
+        .requests(
+            RequestsConfig::builder()
+                .album_detail_requests_per_second(
+                    *section.requests().album_detail_requests_per_second(),
+                )
+                .retry_delays(
+                    section
+                        .requests()
+                        .retry_delays_ms()
+                        .iter()
+                        .map(|delay| Duration::from_millis(delay.get()))
+                        .collect(),
+                )
+                .build(),
+        )
+        .max_connections(*section.max_connections())
+        .proxy(section.proxy().clone())
+        .timeout_secs(*section.timeout_secs())
+        .build()
+}
+
+fn bilibili_config_from(
+    section: &mineral_server::config::BilibiliSection,
+) -> mineral_channel_bilibili::BilibiliConfig {
+    mineral_channel_bilibili::BilibiliConfig::builder()
+        .max_connections(*section.max_connections())
+        .proxy(section.proxy().clone())
+        .timeout_secs(*section.timeout_secs())
+        .build()
+}
+
+fn run_channel_login(channel_id: &str) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let code = rt.block_on(async move {
+        let daemon_path = mineral_paths::config_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("daemon.lua");
+        let Ok((config, _)) = mineral_server::config::load_daemon(&daemon_path) else {
+            return 1;
+        };
+        if channel_id == "bilibili" {
+            let bc = bilibili_config_from(config.sources().bilibili());
+            let cli = mineral_channel_bilibili::cli::BilibiliCli {
+                command: mineral_channel_bilibili::cli::BilibiliCommand::Login,
+            };
+            match mineral_channel_bilibili::cli::run(cli, &bc).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        } else {
+            let nc = netease_config_from(config.sources().netease());
+            let cli = mineral_channel_netease::cli::NeteaseCli {
+                command: mineral_channel_netease::cli::NeteaseCommand::Login,
+            };
+            match mineral_channel_netease::cli::run(cli, &nc).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+    });
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn serve_embedded_daemon() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host = mineral_script::ScriptHost::new(cmd_tx.clone(), push_tx.clone());
+    let dir = mineral_paths::config_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let daemon_path = dir.join("daemon.lua");
+    let Ok(loaded) = mineral_server::config::load_daemon_with_vm(&daemon_path, |lua| {
+        mineral_script::install_daemon_api(lua, &host)
+    }) else {
+        return;
+    };
+
+    rt.block_on(async move {
+        let mineral_server::config::DaemonLoad {
+            config,
+            vm,
+            tree: daemon_tree,
+            ..
+        } = loaded;
+        let script = mineral_server::ScriptParts::new(vm, host, cmd_tx, cmd_rx, push_tx, push_rx);
+        let persist = match mineral_paths::data_dir() {
+            Ok(d) => {
+                let _ = tokio::fs::create_dir_all(&d).await;
+                mineral_server::ServerStore::open(&d.join("mineral.db"))
+                    .await
+                    .unwrap_or_else(|_| mineral_server::ServerStore::disabled())
+            }
+            Err(_) => mineral_server::ServerStore::disabled(),
+        };
+
+        let mut channels = Vec::<std::sync::Arc<dyn mineral_channel_core::MusicChannel>>::new();
+        let mut providers = Vec::<std::sync::Arc<dyn mineral_playback::PlaybackProvider>>::new();
+        channels.push(std::sync::Arc::new(
+            mineral_channel_mineral::MineralChannel::new(std::sync::Arc::new(persist.clone())),
+        ));
+        if let Ok(d) = mineral_paths::data_dir() {
+            let lib = std::sync::Arc::new(mineral_channel_local::LocalLibrary::new(
+                std::sync::Arc::new(persist.scope(SourceKind::LOCAL)),
+                d.join("local-covers"),
+                config.sources().local().roots().clone(),
+            ));
+            channels.push(lib.clone());
+            providers.push(lib);
+        }
+        if let Ok(Some(auth)) = mineral_channel_netease::load_stored() {
+            let nc = netease_config_from(config.sources().netease());
+            if let Ok(ch) = mineral_channel_netease::NeteaseChannel::with_credential(
+                &nc,
+                &auth.music_u,
+                auth.user_id,
+                Some(std::sync::Arc::new(persist.scope(SourceKind::NETEASE))),
+            ) {
+                let arc = std::sync::Arc::new(ch);
+                channels.push(arc.clone());
+                providers.push(arc);
+            }
+        }
+        {
+            let bc = bilibili_config_from(config.sources().bilibili());
+            let ch_res = match mineral_channel_bilibili::load_stored() {
+                Ok(Some(auth)) => {
+                    mineral_channel_bilibili::BilibiliChannel::with_credential(&bc, &auth)
+                }
+                _ => mineral_channel_bilibili::BilibiliChannel::new(&bc),
+            };
+            if let Ok(ch) = ch_res {
+                let arc = std::sync::Arc::new(ch);
+                channels.push(arc.clone());
+                providers.push(arc);
+            }
+        }
+        let Ok(playback) = mineral_playback::PlaybackRegistry::new(providers) else {
+            return;
+        };
+        let sources = mineral_server::SourceBackends::builder()
+            .channels(channels)
+            .playback(playback)
+            .build();
+
+        let Ok(sock_path) = socket_path() else {
+            return;
+        };
+        if mineral_protocol::SocketWire::connect(&sock_path).await.is_ok() {
+            return;
+        }
+        let _ = tokio::fs::remove_file(&sock_path).await;
+
+        #[cfg(unix)]
+        let listener = match tokio::net::UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        #[cfg(windows)]
+        let listener = {
+            let Ok(l) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+                return;
+            };
+            let Ok(addr) = l.local_addr() else {
+                return;
+            };
+            if tokio::fs::write(&sock_path, addr.to_string()).await.is_err() {
+                return;
+            }
+            l
+        };
+
+        let audio_mode = mineral_server::resolve_audio_mode(
+            std::env::var_os("MINERAL_AUDIO_NULL").is_some(),
+            *config.audio().backend(),
+        );
+        let watchdog = mineral_script::WatchdogConfig::builder()
+            .instruction_interval(*config.script().watchdog_instruction_interval())
+            .soft_wall(Duration::from_millis(*config.script().watchdog_soft_wall_ms()))
+            .hard_wall(Duration::from_millis(*config.script().watchdog_hard_wall_ms()))
+            .build();
+        let script_sender = script.sender().clone();
+        let (script_runtime, pumps) = script.spawn_runtime(watchdog, sources.channels());
+        let stats_store = match mineral_paths::data_dir() {
+            Ok(d) => mineral_stats::StatsStore::open(&d.join("stats.db"))
+                .await
+                .unwrap_or_else(|_| mineral_stats::StatsStore::disabled()),
+            Err(_) => mineral_stats::StatsStore::disabled(),
+        };
+        let (stats, stats_actor) = mineral_server::StatsRecorder::spawn(
+            stats_store,
+            mineral_server::params_from_config(config.stats()),
+        );
+        let stats_stop = stats.clone();
+        let Ok(server) = mineral_server::Server::spawn(
+            sources,
+            audio_mode,
+            persist,
+            mineral_server::ServerConfig::from_config(&config),
+            daemon_tree,
+            Some(script_sender.clone()),
+            stats,
+        )
+        .await
+        else {
+            return;
+        };
+        let reload_parts = server.attach_script_pumps(pumps);
+        mineral_server::spawn_script_reloader(
+            daemon_path,
+            script_runtime,
+            script_sender,
+            reload_parts,
+        );
+        let _ = server.start_media_service();
+
+        tokio::select! {
+            _ = server.serve(listener) => {}
+            _ = tokio::signal::ctrl_c() => {}
+            _ = server.shutdown_requested() => {}
+        }
+
+        stats_stop.daemon_stopped();
+        stats_stop.flush().await;
+        server.shutdown().await;
+        stats_stop.shutdown().await;
+        drop(stats_stop);
+        let _ = tokio::time::timeout(Duration::from_secs(2), stats_actor).await;
+        let _ = tokio::fs::remove_file(&sock_path).await;
+    });
+}
+
+async fn run_bridge() {
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -1224,7 +1506,7 @@ async fn main() {
             };
             if line.trim().is_empty() {
                 continue;
-            }
+            };
             match serde_json::from_str::<Value>(&line) {
                 Ok(value) => {
                     if tx.send(value).is_err() {
@@ -1261,4 +1543,25 @@ async fn main() {
         }
     }
     let _ = std::io::stdout().flush();
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("serve") {
+        serve_embedded_daemon();
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("channel") {
+        let ch = args.get(2).map(String::as_str).unwrap_or("netease");
+        let sub = args.get(3).map(String::as_str).unwrap_or("login");
+        if sub == "login" {
+            run_channel_login(ch);
+            return;
+        }
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(run_bridge());
 }

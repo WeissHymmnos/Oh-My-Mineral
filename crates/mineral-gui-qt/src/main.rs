@@ -1,4 +1,5 @@
 //! Qt 6 shell. Widgets are Qt; playback, search and the ten modes stay in Rust.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};

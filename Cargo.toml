@@ -6,3 +6,9 @@ members = [
   "crates/mineral-gui-gtk",
   "crates/mineral-gui-qt",
 ]
+
+[patch.crates-io]
+mineral-paths = { path = "vendor/mineral-paths" }
+mineral-protocol = { path = "vendor/mineral-protocol" }
+mineral-script = { path = "vendor/mineral-script" }
+mineral-server = { path = "vendor/mineral-server" }

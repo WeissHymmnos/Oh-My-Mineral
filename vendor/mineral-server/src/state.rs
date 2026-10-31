@@ -1,0 +1,365 @@
+//! 服务端持有的「播放上下文」内部状态。[`crate::player::PlayerCore`] 用 `Mutex<State>` 包它,
+//! 队列计算([`crate::queue`])与播放模式切换直接读写其字段。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use mineral_model::{Envelope, PlaybackMediaInfo, Song, SongId};
+use mineral_playback::DirectMedia;
+use mineral_protocol::{
+    AdvanceKind, CurrentSync, PlayCursor, PlayMode, PlaybackOrigin, PlayerSync, PlayerVersions,
+    QueueSync, SegmentVersion,
+};
+use tokio::sync::watch;
+
+use crate::gapless::PrefetchState;
+use crate::playback_instance::{PlaybackInstanceId, PlaybackSlot};
+
+/// 播放状态变更发布器:queue / current 版本每次推进都唤醒订阅者。
+///
+/// 只发布单调 generation。每个订阅者被唤醒后按自己的已知版本读取状态,
+/// 仅克隆版本不一致的重段。
+pub(crate) struct StatePublisher {
+    /// 最新 generation(初始 0 = 无变更)。
+    tx: watch::Sender<u64>,
+
+    /// 下一个 generation 值。
+    next: AtomicU64,
+}
+
+impl StatePublisher {
+    /// 创建发布器与订阅端。
+    pub(crate) fn new() -> (Arc<Self>, watch::Receiver<u64>) {
+        let (tx, rx) = watch::channel(0_u64);
+        (
+            Arc::new(Self {
+                tx,
+                next: AtomicU64::new(0),
+            }),
+            rx,
+        )
+    }
+
+    /// 发布一次变更(无订阅者时静默)。
+    fn publish(&self) {
+        let value = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let _ = self.tx.send(value);
+    }
+}
+
+/// 一次队列编辑前的队列全貌,供撤销还原。
+///
+/// 只回滚队列结构,**不回滚播放**:撤销一次「删在播曲」后,那首歌回到队列里、游标从悬空
+/// 变回附着,但它自始至终没有断过声。
+pub(crate) struct QueueSnapshot {
+    /// 编辑前的队列。
+    pub(crate) queue: Vec<Song>,
+
+    /// 编辑前的 shuffle 原序。
+    pub(crate) original_queue: Option<Vec<Song>>,
+
+    /// 编辑前的游标。
+    pub(crate) cursor: PlayCursor,
+}
+
+/// 播放上下文。字段对 crate 内开放(队列计算 / 模式切换 / 播放编排直接读写)。
+pub(crate) struct State {
+    /// 当前在播的歌。
+    pub(crate) current_song: Option<Song>,
+
+    /// Active current playback attempt and its cancellation root.
+    pub(crate) current_slot: Option<PlaybackSlot>,
+
+    /// Final facts of the decoder input currently submitted to audio.
+    pub(crate) media_info: Option<PlaybackMediaInfo>,
+
+    /// Optional direct capability associated with the current opened media.
+    pub(crate) direct_media: Option<DirectMedia>,
+
+    /// 当前在播音频的来源(下载 / 缓存 / 远端);切歌时由 `play_song` 写入。
+    pub(crate) play_origin: Option<PlaybackOrigin>,
+
+    /// 当前队列的语境(来自搜索 / 歌单 / 专辑 / 艺人 / 手动;atomic `play_queue` 时写入)。
+    /// 埋点 provenance:随该队列每个起播继承进 plays 的 context 列。
+    pub(crate) queue_context: mineral_stats::QueueContext,
+
+    /// 插队散曲的 per-song 语境覆盖(`qualified id → QueueContext`;insert_next / append
+    /// 时按曲落一条)。起播该曲时优先取覆盖值再移除,使插队曲记自身来源而非继承队列级
+    /// context——不污染歌单归属。
+    pub(crate) context_overrides: rustc_hash::FxHashMap<String, mineral_stats::QueueContext>,
+
+    /// 当前队列(顺序模式 = 原序;shuffle 模式 = 洗过)。
+    pub(crate) queue: Vec<Song>,
+
+    /// 当前歌在 `queue` 中的位置(悬空态见 [`PlayCursor::Detached`])。
+    pub(crate) cursor: PlayCursor,
+
+    /// shuffle 切换前的原始顺序,关 shuffle 时还原用;非 shuffle 模式下为 `None`。
+    pub(crate) original_queue: Option<Vec<Song>>,
+
+    /// 上一次队列编辑前的快照,供撤销。单级:撤销后即清空,不支持连撤与重做。
+    pub(crate) queue_undo: Option<QueueSnapshot>,
+
+    /// 当前播放模式(顺序 / 单曲 / 列表循环 / shuffle)。
+    pub(crate) play_mode: PlayMode,
+
+    /// 当前曲的进入档位, 恒指向 `current_song`
+    pub(crate) advance: Option<(SongId, AdvanceKind)>,
+
+    /// 当前歌的歌词(从 LyricsReady 写入)。
+    pub(crate) current_lyrics: Option<mineral_model::Lyrics>,
+
+    /// 当前 lyrics 配对的歌 id(对不上 current_song 时不返回)。
+    pub(crate) current_lyrics_song_id: Option<SongId>,
+
+    /// Exclusive lifecycle of the next-song preparation attempt.
+    pub(crate) prefetch: PrefetchState,
+
+    /// 本预取窗口内被 hook 否决(`Skip`)的队列**下标**:`next_index` 预测/推进时越过,
+    /// 队列本身不动。按下标记(与推进「以下标为真相」同条,重复曲互不吸附);任何队列
+    /// 变更/切歌/边界消费都清空,故下标不会陈旧。生命周期整族挂靠预取簿记
+    /// (见 [`Self::invalidate_prefetch`])。
+    pub(crate) prefetch_vetoed: Vec<usize>,
+
+    /// queue + original_queue 的版本号。从 [`SegmentVersion::FIRST`] 起步(0 = client
+    /// 一无所有),变更处经 [`Self::bump_queue`] 推进;[`Self::sync`] 据此决定是否
+    /// 附带 queue 重段。
+    pub(crate) queue_version: SegmentVersion,
+
+    /// current_song / media facts / lyrics 的版本号,语义同 `queue_version`。
+    pub(crate) current_version: SegmentVersion,
+
+    /// 变更发布器(单测的 `State::empty` 为 `None`)。
+    pub(crate) publisher: Option<Arc<StatePublisher>>,
+}
+
+impl State {
+    /// 空 State,所有字段取默认/空值。
+    pub(crate) fn empty() -> Self {
+        Self {
+            current_song: None,
+            current_slot: None,
+            media_info: None,
+            direct_media: None,
+            play_origin: None,
+            advance: None,
+            queue_context: mineral_stats::QueueContext::Unknown,
+            context_overrides: rustc_hash::FxHashMap::default(),
+            queue: Vec::new(),
+            cursor: PlayCursor::default(),
+            queue_undo: None,
+            original_queue: None,
+            play_mode: PlayMode::default(),
+            current_lyrics: None,
+            current_lyrics_song_id: None,
+            prefetch: PrefetchState::default(),
+            prefetch_vetoed: Vec::new(),
+            queue_version: SegmentVersion::FIRST,
+            current_version: SegmentVersion::FIRST,
+            publisher: None,
+        }
+    }
+
+    /// 作废 gapless 预取簿记三件套(预排曲 / 预拉标记 / 否决集),让 `check_prefetch`
+    /// 在下个 tick 按当前队列重排。队列变更 / 插播 / 追加 / 切歌等改变「下一首」预测
+    /// 的地方调用;引擎里可能已建的 next 槽由调用方另行 `audio.clear_next()`。
+    pub(crate) fn invalidate_prefetch(&mut self) {
+        drop(self.prefetch.invalidate());
+        self.prefetch_vetoed.clear();
+    }
+
+    /// Cancels active prefetch work and returns armed facts for capture cleanup.
+    pub(crate) fn take_prefetch(&mut self) -> Option<crate::gapless::Queued> {
+        self.prefetch_vetoed.clear();
+        self.prefetch.invalidate()
+    }
+
+    /// 队列结构编辑后的预取维护——**精确**作废,不照抄 [`Self::invalidate_prefetch`]。
+    ///
+    /// 否决集存的是下标,重排后必然陈旧,无条件清。但已排的下一曲只在「下一首真的换了」
+    /// 时才作废:删在播曲这类编辑并不改变下一首,连带作废反而打断 gapless——而且已 append
+    /// 进 sink 的预排撤不掉,会先响半秒过期曲再被切走。
+    ///
+    /// # Return:
+    ///   预排是否被作废(为真时调用方需同步取消引擎侧待建预排)。
+    pub(crate) fn revalidate_prefetch_after_edit(&mut self) -> bool {
+        self.prefetch_vetoed.clear();
+        let armed = self.prefetch.song_id().cloned();
+        let Some(armed) = armed else {
+            return false;
+        };
+        if crate::queue::next_in_queue(self).is_some_and(|next| next.id == armed) {
+            return false;
+        }
+        drop(self.prefetch.invalidate());
+        true
+    }
+
+    /// 版本门控同步:轻段恒出,重段仅在 `known` 落后于本端版本时 clone 附带。
+    ///
+    /// 与版本号读取在同一把锁内(caller 持锁调用),无「版本与数据错位」竞态。
+    ///
+    /// # Params:
+    ///   - `known`: client 已持有的版本号(0 = 一无所有)
+    ///
+    /// # Return:
+    ///   组装好的 [`PlayerSync`]。
+    pub(crate) fn sync(&self, known: PlayerVersions) -> PlayerSync {
+        let queue = (known.queue != self.queue_version).then(|| QueueSync {
+            queue: self.queue.clone(),
+            original_queue: self.original_queue.clone(),
+        });
+        let current = (known.current != self.current_version).then(|| CurrentSync {
+            current_song: self.current_song.clone(),
+            direct_media: self.direct_media.clone(),
+            media_info: self.media_info.clone(),
+            current_lyrics: self.current_lyrics.clone(),
+            current_lyrics_song_id: self.current_lyrics_song_id.clone(),
+            current_envelope: self
+                .current_slot
+                .as_ref()
+                .filter(|slot| {
+                    self.current_song
+                        .as_ref()
+                        .is_some_and(|song| song.id == slot.song_id)
+                })
+                .and_then(|slot| slot.envelope.clone()),
+            advance: self.advance.as_ref().map(|(_, kind)| *kind),
+        });
+        PlayerSync {
+            versions: PlayerVersions {
+                queue: self.queue_version,
+                current: self.current_version,
+            },
+            cursor: self.cursor,
+            play_mode: self.play_mode,
+            play_origin: self.play_origin,
+            queue,
+            current,
+        }
+    }
+
+    /// queue / original_queue 发生变更后调用,推进版本号让 client 下次同步收到重段。
+    pub(crate) fn bump_queue(&mut self) {
+        self.queue_version = self.queue_version.next();
+        self.notify_subscribers();
+    }
+
+    /// current_song / resolved / lyrics 发生变更后调用,推进版本号。
+    pub(crate) fn bump_current(&mut self) {
+        self.current_version = self.current_version.next();
+        self.notify_subscribers();
+    }
+
+    /// 唤醒状态订阅者:订阅者被唤醒后按自己的已知版本重读状态(未接入发布器时空操作)。
+    pub(crate) fn notify_subscribers(&self) {
+        if let Some(publisher) = &self.publisher {
+            publisher.publish();
+        }
+    }
+
+    /// Stores an envelope on its live playback instance, including armed prefetch media.
+    /// Only a current-slot update publishes a new current version; promotion carries prefetch data.
+    pub(crate) fn adopt_envelope(
+        &mut self,
+        instance_id: PlaybackInstanceId,
+        song_id: &SongId,
+        envelope: Envelope,
+    ) -> bool {
+        if let Some(slot) = self.current_slot.as_mut()
+            && slot.matches(instance_id, song_id)
+            && !slot.cancellation.is_cancelled()
+        {
+            slot.envelope = Some(envelope);
+            self.bump_current();
+            return true;
+        }
+        if let Some(slot) = self.prefetch.slot_mut()
+            && slot.matches(instance_id, song_id)
+            && !slot.cancellation.is_cancelled()
+        {
+            slot.envelope = Some(envelope);
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use color_eyre::eyre::eyre;
+    use mineral_protocol::{PlayCursor, PlayMode, PlayerVersions, SegmentVersion};
+    use mineral_test::song;
+    use pretty_assertions::assert_eq;
+
+    use super::State;
+
+    /// 造一个有 queue + current 的 State(版本仍是初始 1/1)。
+    fn populated() -> State {
+        let mut st = State::empty();
+        st.queue = vec![song("a"), song("b")];
+        st.cursor = PlayCursor::InQueue(1);
+        st.current_song = Some(song("b"));
+        st.play_mode = PlayMode::RepeatAll;
+        st
+    }
+
+    /// known=0(client 一无所有)必然落后 → 两重段全量返回,轻段字段同出。
+    #[test]
+    fn sync_zero_versions_gets_full_payload() -> color_eyre::Result<()> {
+        let st = populated();
+        let sync = st.sync(PlayerVersions::default());
+        assert_eq!(sync.versions.queue, SegmentVersion::FIRST);
+        assert_eq!(sync.versions.current, SegmentVersion::FIRST);
+        assert_eq!(sync.cursor, PlayCursor::InQueue(1));
+        assert_eq!(sync.play_mode, PlayMode::RepeatAll);
+        let q = sync.queue.ok_or_else(|| eyre!("queue 重段应存在"))?;
+        assert_eq!(q.queue.len(), 2);
+        assert!(q.original_queue.is_none());
+        let c = sync.current.ok_or_else(|| eyre!("current 重段应存在"))?;
+        assert_eq!(c.current_song, Some(song("b")));
+        Ok(())
+    }
+
+    /// 版本一致 → 两重段都缺席(稳态 tick 的主路径,payload 仅轻段)。
+    #[test]
+    fn sync_matching_versions_light_only() {
+        let st = populated();
+        let sync = st.sync(PlayerVersions {
+            queue: SegmentVersion::FIRST,
+            current: SegmentVersion::FIRST,
+        });
+        assert!(sync.queue.is_none());
+        assert!(sync.current.is_none());
+        assert_eq!(sync.cursor, PlayCursor::InQueue(1));
+        assert_eq!(sync.play_mode, PlayMode::RepeatAll);
+    }
+
+    /// 仅 queue 版本落后 → 只发 queue 重段,current 缺席。
+    #[test]
+    fn sync_stale_queue_only_sends_queue_section() {
+        let mut st = populated();
+        st.bump_queue();
+        let sync = st.sync(PlayerVersions {
+            queue: SegmentVersion::FIRST,
+            current: SegmentVersion::FIRST,
+        });
+        assert_eq!(sync.versions.queue, SegmentVersion::new(2));
+        assert!(sync.queue.is_some());
+        assert!(sync.current.is_none());
+    }
+
+    /// 仅 current 版本落后 → 只发 current 重段,queue 缺席。
+    #[test]
+    fn sync_stale_current_only_sends_current_section() {
+        let mut st = populated();
+        st.bump_current();
+        let sync = st.sync(PlayerVersions {
+            queue: SegmentVersion::FIRST,
+            current: SegmentVersion::FIRST,
+        });
+        assert_eq!(sync.versions.current, SegmentVersion::new(2));
+        assert!(sync.queue.is_none());
+        assert!(sync.current.is_some());
+    }
+}
