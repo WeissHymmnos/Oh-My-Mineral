@@ -1,0 +1,106 @@
+name: Build & Publish Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets to (e.g. v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-packages:
+    name: Linux (.rpm / .deb / .tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Qt6, GTK4 & ALSA dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config qt6-base-dev libgtk-4-dev libasound2-dev libdbus-1-dev cpio xz-utils binutils
+      - name: Install Mineral Daemon
+        run: cargo install mineral --version 0.5.10 --locked || cargo install mineral --version 0.5.10
+      - name: Build & Package (.rpm, .deb, .tar.gz)
+        run: |
+          rm -f .cargo/config.toml
+          python3 scripts/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mineral-gui-linux-x86_64
+          path: |
+            dist/*.rpm
+            dist/*.deb
+            dist/*.tar.gz
+
+  macos-package:
+    name: macOS (.app / .dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Qt6 via Homebrew
+        run: |
+          brew install qt@6 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix qt@6)/lib/pkgconfig" >> $GITHUB_ENV
+          echo "QT_ROOT_DIR=$(brew --prefix qt@6)" >> $GITHUB_ENV
+          echo "$(brew --prefix qt@6)/bin" >> $GITHUB_PATH
+      - name: Install Mineral Daemon
+        run: cargo install mineral --version 0.5.10 --locked || cargo install mineral --version 0.5.10
+      - name: Build & Package macOS .dmg
+        run: |
+          rm -f .cargo/config.toml
+          chmod +x scripts/package_macos.sh
+          ./scripts/package_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mineral-gui-macos
+          path: dist/*.dmg
+
+  windows-package:
+    name: Windows (x86_64 .zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Qt 6 for Windows MSVC
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.7.3"
+      - name: Build & Package Windows .zip
+        shell: pwsh
+        run: |
+          if (Test-Path ".cargo\config.toml") { Remove-Item -Force ".cargo\config.toml" }
+          .\scripts\package_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mineral-gui-windows
+          path: dist/*.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [linux-packages, macos-package, windows-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || 'v0.1.0' }}
+          name: "Mineral GUI ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || 'v0.1.0' }}"
+          files: |
+            release-assets/*.rpm
+            release-assets/*.deb
+            release-assets/*.tar.gz
+            release-assets/*.dmg
+            release-assets/*.zip
+          generate_release_notes: true

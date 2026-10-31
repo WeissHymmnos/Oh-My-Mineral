@@ -1,0 +1,24 @@
+[package]
+name = "mineral-gui-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "JSON-lines bridge from Mineral GUI clients to the Mineral daemon"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "mineral-gui-bridge"
+path = "src/main.rs"
+
+[dependencies]
+mineral-audio = "0.5.10"
+mineral-channel-core = "0.5.10"
+mineral-client = "0.5.10"
+mineral-model = "0.5.10"
+mineral-paths = "0.5.10"
+mineral-protocol = "0.5.10"
+mineral-task = "0.5.10"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "process"] }
+# 0.7.20 makes LengthDelimitedCodec's Encoder impl ambiguous for Mineral 0.5.10.
+tokio-util = { version = "=0.7.18", features = ["codec", "io"] }

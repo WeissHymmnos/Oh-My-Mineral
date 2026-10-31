@@ -1,0 +1,11 @@
+[package]
+name = "mineral-gui-gtk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+gtk4 = "0.9"
+mineral-gui-core = { path = "../mineral-gui-core" }
+serde_json = "1"

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+  "bridge",
+  "crates/mineral-gui-core",
+  "crates/mineral-gui-gtk",
+  "crates/mineral-gui-qt",
+]

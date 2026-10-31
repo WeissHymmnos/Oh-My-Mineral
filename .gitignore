@@ -1,0 +1,8 @@
+target/
+.sysroot/
+.venv/
+__pycache__/
+*.pyc
+bridge/target/
+dist/
+.cargo/config.toml
