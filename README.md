@@ -1,10 +1,10 @@
 # Mineral GUI
 
-Mineral 的桌面客户端，Qt 6 与 GTK 4 各有一个壳，共用同一套 Rust 会话核心（`mineral-gui-core`）与桥接进程（`mineral-gui-bridge`）。播放仍由 Mineral daemon 负责，界面只是它的 client。交互完整遵循 `docs/gui-interaction-design.md`：十种模式可以随时切换和叠加，搜索、队列、歌词和播放状态不因切换而复制或清空。
+Mineral 的桌面客户端
 
 ## 构建与测试
 
-开发头文件与 `.pc` 配置放在本机 `.sysroot`（不需要 root），`.cargo/config.toml` 已自动指向它。
+
 
 ```bash
 cargo test --workspace
