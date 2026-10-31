@@ -1,10 +1,13 @@
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDialog>
+#include <QDir>
 #include <QEasingCurve>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHash>
@@ -19,6 +22,7 @@
 #include <QMenu>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QProcess>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScreen>
@@ -27,6 +31,7 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTimer>
@@ -1394,6 +1399,226 @@ QDialog* make_card(const QString& title, const QString& placeholder, QLineEdit**
     *list_out = list;
     return dialog;
 }
+
+QString find_mineral_binary() {
+#ifdef Q_OS_WIN
+    const QString exe_name = QStringLiteral("mineral.exe");
+#else
+    const QString exe_name = QStringLiteral("mineral");
+#endif
+    const QString beside_app = QDir(QCoreApplication::applicationDirPath()).filePath(exe_name);
+    if (QFileInfo::exists(beside_app)) {
+        return beside_app;
+    }
+    const QString in_path = QStandardPaths::findExecutable(QStringLiteral("mineral"));
+    if (!in_path.isEmpty()) {
+        return in_path;
+    }
+    const QString cargo_bin = QDir(QDir::homePath()).filePath(QStringLiteral(".cargo/bin/") + exe_name);
+    if (QFileInfo::exists(cargo_bin)) {
+        return cargo_bin;
+    }
+    return QStringLiteral("mineral");
+}
+
+QPixmap render_dense1x2_qr(const QStringList& qr_lines) {
+    int max_cols = 0;
+    for (const QString& line : qr_lines) {
+        max_cols = std::max(max_cols, static_cast<int>(line.size()));
+    }
+    const int char_rows = static_cast<int>(qr_lines.size());
+    if (max_cols < 16 || char_rows < 8) return QPixmap();
+    const int px_w = max_cols;
+    const int px_h = char_rows * 2;
+    std::vector<int> grid(static_cast<size_t>(px_w * px_h), 0);
+    for (int r = 0; r < char_rows; ++r) {
+        const QString& line = qr_lines[r];
+        for (int c = 0; c < line.size(); ++c) {
+            const ushort u = line[c].unicode();
+            int top_bit = 0;
+            int bot_bit = 0;
+            if (u == 0x2588) { // '█'
+                top_bit = 1;
+                bot_bit = 1;
+            } else if (u == 0x2580) { // '▀'
+                top_bit = 1;
+                bot_bit = 0;
+            } else if (u == 0x2584) { // '▄'
+                top_bit = 0;
+                bot_bit = 1;
+            }
+            grid[static_cast<size_t>((2 * r) * px_w + c)] = top_bit;
+            grid[static_cast<size_t>((2 * r + 1) * px_w + c)] = bot_bit;
+        }
+    }
+    const int bg_bit = grid[0];
+    QImage img(px_w, px_h, QImage::Format_RGB32);
+    const QRgb white = qRgb(255, 255, 255);
+    const QRgb dark = qRgb(26, 22, 21);
+    for (int y = 0; y < px_h; ++y) {
+        for (int x = 0; x < px_w; ++x) {
+            const int b = grid[static_cast<size_t>(y * px_w + x)];
+            img.setPixel(x, y, (b == bg_bit) ? white : dark);
+        }
+    }
+    return QPixmap::fromImage(img.scaled(264, 264, Qt::KeepAspectRatio, Qt::FastTransformation));
+}
+
+void open_qr_login_dialog(const QString& channel_id) {
+    const bool is_bili = (channel_id == QStringLiteral("bilibili"));
+    const QString brand = is_bili ? QStringLiteral("Bilibili") : QStringLiteral("NetEase Cloud Music");
+
+    auto* dlg = new QDialog(window);
+    dlg->setWindowTitle(brand + QStringLiteral(" — QR Code Login"));
+    dlg->setModal(true);
+    dlg->setStyleSheet(shell_style(touch_on));
+    dlg->resize(430, 500);
+
+    auto* v = new QVBoxLayout(dlg);
+    v->setContentsMargins(24, 20, 24, 20);
+    v->setSpacing(12);
+
+    auto* title_lbl = new QLabel(brand + QStringLiteral(" QR Code Login"));
+    title_lbl->setObjectName("heading");
+    title_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(title_lbl);
+
+    auto* sub_lbl = new QLabel(QStringLiteral("Open the ") + brand + QStringLiteral(" mobile app and scan the QR code below to sign in:"));
+    sub_lbl->setObjectName("muted");
+    sub_lbl->setWordWrap(true);
+    sub_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(sub_lbl);
+
+    auto* qr_card = new QFrame();
+    qr_card->setFixedSize(292, 292);
+    qr_card->setStyleSheet(
+        "QFrame { background: #FFFFFF; border: 1px solid #E4DCD6; border-radius: 18px; }"
+    );
+    auto* qr_card_layout = new QVBoxLayout(qr_card);
+    qr_card_layout->setContentsMargins(14, 14, 14, 14);
+    auto* qr_lbl = new QLabel(QStringLiteral("Generating QR Code…"));
+    qr_lbl->setFixedSize(264, 264);
+    qr_lbl->setAlignment(Qt::AlignCenter);
+    qr_lbl->setStyleSheet("QLabel { color: #7C7370; font-size: 13px; border: none; background: transparent; }");
+    qr_card_layout->addWidget(qr_lbl, 0, Qt::AlignCenter);
+    v->addWidget(qr_card, 0, Qt::AlignCenter);
+
+    auto* status_lbl = new QLabel(QStringLiteral("Requesting login QR code from ") + brand + QStringLiteral("…"));
+    status_lbl->setObjectName("muted");
+    status_lbl->setWordWrap(true);
+    status_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(status_lbl);
+
+    v->addStretch(1);
+
+    auto* btn_row = new QHBoxLayout();
+    auto* refresh_btn = new QPushButton(QStringLiteral("Refresh QR Code"));
+    refresh_btn->setObjectName("ghost");
+    refresh_btn->setCursor(Qt::PointingHandCursor);
+    auto* close_btn = new QPushButton(QStringLiteral("Close"));
+    close_btn->setObjectName("chip");
+    close_btn->setCursor(Qt::PointingHandCursor);
+    btn_row->addStretch(1);
+    btn_row->addWidget(refresh_btn);
+    btn_row->addWidget(close_btn);
+    btn_row->addStretch(1);
+    v->addLayout(btn_row);
+
+    auto* proc = new QProcess(dlg);
+    auto* stdout_buf = new QString();
+    auto* qr_rendered = new bool(false);
+
+    auto start_login_proc = [proc, channel_id, qr_lbl, status_lbl, brand, stdout_buf, qr_rendered]() {
+        if (proc->state() != QProcess::NotRunning) {
+            proc->kill();
+            proc->waitForFinished(300);
+        }
+        stdout_buf->clear();
+        *qr_rendered = false;
+        qr_lbl->setPixmap(QPixmap());
+        qr_lbl->setText(QStringLiteral("Generating QR Code…"));
+        status_lbl->setText(QStringLiteral("Requesting login QR code from ") + brand + QStringLiteral("…"));
+        proc->start(find_mineral_binary(), {QStringLiteral("channel"), channel_id, QStringLiteral("login")});
+    };
+
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, dlg, [proc, qr_lbl, status_lbl, stdout_buf, qr_rendered]() {
+        *stdout_buf += QString::fromUtf8(proc->readAllStandardOutput());
+        const QStringList lines = stdout_buf->split('\n');
+        QStringList qr_lines;
+        for (QString line : lines) {
+            if (line.endsWith('\r')) line.chop(1);
+            if (line.startsWith(QStringLiteral("Logged in."))) {
+                status_lbl->setText(line);
+                continue;
+            }
+            if (line.size() < 16) continue;
+            bool is_qr_row = true;
+            for (const QChar ch : line) {
+                const ushort u = ch.unicode();
+                if (u != 0x2588 && u != 0x2580 && u != 0x2584 && u != 0x0020) {
+                    is_qr_row = false;
+                    break;
+                }
+            }
+            if (is_qr_row) {
+                qr_lines.push_back(line);
+            }
+        }
+        if (!*qr_rendered && qr_lines.size() >= 14) {
+            const QPixmap pm = render_dense1x2_qr(qr_lines);
+            if (!pm.isNull()) {
+                *qr_rendered = true;
+                qr_lbl->setText(QString());
+                qr_lbl->setPixmap(pm);
+                status_lbl->setText(QStringLiteral("Scan the QR code with your phone and confirm login."));
+            }
+        }
+    });
+
+    QObject::connect(proc, &QProcess::readyReadStandardError, dlg, [proc, status_lbl, brand]() {
+        const QString err_text = QString::fromUtf8(proc->readAllStandardError());
+        const QStringList lines = err_text.split('\n', Qt::SkipEmptyParts);
+        for (QString line : lines) {
+            line = line.trimmed();
+            if (line.contains(QStringLiteral("waiting for phone confirmation"), Qt::CaseInsensitive)) {
+                status_lbl->setText(QStringLiteral("Scanned! Please tap 'Confirm Login' on your phone…"));
+            } else if (line.contains(QStringLiteral("waiting for scan"), Qt::CaseInsensitive)
+                       || line.contains(QStringLiteral("scan and confirm"), Qt::CaseInsensitive)) {
+                status_lbl->setText(QStringLiteral("Waiting for ") + brand + QStringLiteral(" mobile app to scan the QR code…"));
+            } else if (!line.isEmpty()) {
+                status_lbl->setText(line);
+            }
+        }
+    });
+
+    QObject::connect(proc,
+                     QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     dlg,
+                     [dlg, status_lbl, brand](int exit_code, QProcess::ExitStatus status) {
+                         if (status == QProcess::NormalExit && exit_code == 0) {
+                             status_lbl->setText(brand + QStringLiteral(" login successful! Reloading daemon to sync your account…"));
+                             push_action("{\"action\":\"restart_daemon\"}");
+                             QTimer::singleShot(900, dlg, &QDialog::accept);
+                         } else if (status == QProcess::NormalExit) {
+                             status_lbl->setText(QStringLiteral("Login session ended or expired (code ")
+                                                 + QString::number(exit_code)
+                                                 + QStringLiteral("). Click 'Refresh QR Code' to try again."));
+                         }
+                     });
+
+    QObject::connect(refresh_btn, &QPushButton::clicked, dlg, start_login_proc);
+    QObject::connect(close_btn, &QPushButton::clicked, dlg, &QDialog::reject);
+
+    start_login_proc();
+    dlg->exec();
+    if (proc->state() != QProcess::NotRunning) {
+        proc->kill();
+        proc->waitForFinished(300);
+    }
+    delete stdout_buf;
+    delete qr_rendered;
+    dlg->deleteLater();
+}
 }  // namespace
 
 extern "C" void qt_init() {
@@ -1654,6 +1879,9 @@ extern "C" void qt_init() {
         push_action(was_mini ? "{\"action\":\"back\"}" : "{\"action\":\"scheme\",\"scheme\":\"mini\"}");
     });
     menu->addAction("Toggle Fullscreen Player (Z)", [] { push_action("{\"action\":\"toggle_immersive\"}"); });
+    menu->addSeparator();
+    menu->addAction("Login: NetEase Cloud Music (QR Code)…", [] { open_qr_login_dialog(QStringLiteral("netease")); });
+    menu->addAction("Login: Bilibili (QR Code)…", [] { open_qr_login_dialog(QStringLiteral("bilibili")); });
     menu->addSeparator();
     menu->addAction("Reconnect Daemon", [] { push_action("{\"action\":\"connect\"}"); });
     menu->addAction("Launch Playback Daemon", [] { push_action("{\"action\":\"launch_daemon\"}"); });
@@ -2759,6 +2987,13 @@ extern "C" void qt_init() {
         if (key == "settings:daemon:restart") { push_action("{\"action\":\"restart_daemon\"}"); return true; }
         if (key == "settings:daemon:audio_output") { push_action("{\"action\":\"cycle_audio_output\"}"); return true; }
         if (key == "settings:daemon:reset_defaults") { push_action("{\"action\":\"daemon_config_reset\"}"); return true; }
+        if (key == "settings:login:netease") { open_qr_login_dialog(QStringLiteral("netease")); return true; }
+        if (key == "settings:login:bilibili") { open_qr_login_dialog(QStringLiteral("bilibili")); return true; }
+        if ((key == "source:netease" || key == "source:bilibili")
+            && item->data(mineral_ui::RoleSubtitle).toString().contains(QStringLiteral("Not logged in"), Qt::CaseInsensitive)) {
+            open_qr_login_dialog(key.mid(7));
+            return true;
+        }
         if (key == "settings:daemon:edit_lua") {
             const QString src = item->data(mineral_ui::RoleSource).toString();
             const QString lua = src.startsWith("lua|") ? src.mid(4) : src;
@@ -2868,6 +3103,11 @@ extern "C" void qt_init() {
             return;
         }
         if (kind == "playlist" || kind == "album" || kind == "artist" || kind == "source") {
+            if (raw_key == "source:netease" || raw_key == "source:bilibili") {
+                const QString ch = raw_key.mid(7);
+                ctx.addAction("QR Code Login / Switch Account…", [ch] { open_qr_login_dialog(ch); });
+                ctx.addSeparator();
+            }
             ctx.addAction("Open Details", [key] { push_action(QString("{\"action\":\"activate\",\"key\":\"%1\"}").arg(key)); });
             ctx.addAction("Play All Tracks", [key] { push_action(QString("{\"action\":\"play_container\",\"key\":\"%1\"}").arg(key)); });
         } else {

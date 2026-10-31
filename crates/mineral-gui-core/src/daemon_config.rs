@@ -1076,6 +1076,22 @@ impl DaemonConfigData {
             "action|daemon_config_reset".to_owned(),
         ));
 
+        // ── Section 0.5: Online Source Accounts (QR Code Login) ──
+        items.push(mk(
+            "settings:login:netease",
+            "Account · NetEase Cloud Music QR Login",
+            "Click to scan QR code with NetEase Cloud Music app",
+            "Saves credentials & reloads daemon",
+            "action|qr_login_netease".to_owned(),
+        ));
+        items.push(mk(
+            "settings:login:bilibili",
+            "Account · Bilibili QR Login",
+            "Click to scan QR code with Bilibili app",
+            "Saves credentials & reloads daemon",
+            "action|qr_login_bilibili".to_owned(),
+        ));
+
         // ── Section 1: Audio Engine & Envelope (`audio.*`) ──
         items.push(mk(
             "settings:daemon:audio.playback_quality",

@@ -2234,7 +2234,11 @@ impl<B: Backend> Session<B> {
             let status = if !source.available {
                 "Unavailable"
             } else if !source.logged_in {
-                "Not logged in"
+                if matches!(source.id.as_str(), "netease" | "bilibili") {
+                    "Not logged in · Click for QR Code Login"
+                } else {
+                    "Not logged in"
+                }
             } else if source.searchable.is_empty() {
                 "Local / Basic Source"
             } else {
