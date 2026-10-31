@@ -2515,8 +2515,8 @@ extern "C" void qt_init() {
         else push_action("{\"action\":\"clear_notices\"}");
     });
     QObject::connect(save_pl_btn, &QPushButton::clicked, [] {
-        const QString name = save_playlist_box ? escape_json(save_playlist_box->text()) : QString();
-        push_action(QString("{\"action\":\"save_queue_playlist\",\"name\":\"%1\"}").arg(name.isEmpty() ? QStringLiteral("Queue Playlist") : name));
+        const QString pl_name = save_playlist_box ? escape_json(save_playlist_box->text()) : QString();
+        push_action(QString("{\"action\":\"save_queue_playlist\",\"name\":\"%1\"}").arg(pl_name.isEmpty() ? QStringLiteral("Queue Playlist") : pl_name));
         if (save_playlist_box) save_playlist_box->clear();
     });
     QObject::connect(ql_add_btn, &QPushButton::clicked, [] { push_action("{\"action\":\"enqueue\",\"key\":\"\"}"); });

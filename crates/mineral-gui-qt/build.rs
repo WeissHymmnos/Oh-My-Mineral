@@ -12,6 +12,7 @@ fn main() {
         .define("NOMINMAX", None)
         .flag_if_supported("-std=c++17")
         .flag_if_supported("/std:c++17")
+        .flag_if_supported("/permissive-")
         .flag_if_supported("/Zc:__cplusplus")
         .flag_if_supported("/utf-8")
         .flag_if_supported("/EHsc");

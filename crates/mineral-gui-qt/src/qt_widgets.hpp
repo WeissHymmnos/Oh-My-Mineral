@@ -757,7 +757,7 @@ inline QPixmap make_generative_cover(const QString& title, const QString& kind, 
         {"#E4DDD7", "#B87A64"}, // Warm clay + terracotta
         {"#DCE3DC", "#5E7B68"}  // Soft sage + forest
     };
-    uint h = qHash(title.isEmpty() ? QStringLiteral("Mineral") : title);
+    const uint h = static_cast<uint>(qHash(title.isEmpty() ? QStringLiteral("Mineral") : title));
     const auto& pal = palettes[h % 5];
     QColor bg(pal.first);
     QColor fg(pal.second);
