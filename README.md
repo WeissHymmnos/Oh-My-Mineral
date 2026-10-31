@@ -1,6 +1,6 @@
 # Mineral GUI
 
-Mineral 的桌面客户端
+[Mineral](https://github.com/10knamesmore/Mineral) 的桌面客户端
 
 ## 构建与测试
 
