@@ -2236,6 +2236,8 @@ impl<B: Backend> Session<B> {
             } else if !source.logged_in {
                 if matches!(source.id.as_str(), "netease" | "bilibili") {
                     "Not logged in · Click for QR Code Login"
+                } else if source.id == "am" {
+                    "Not logged in · Click for Token Login"
                 } else {
                     "Not logged in"
                 }
@@ -3378,3 +3380,27 @@ mod tfidf_recommender_tests {
 }
 
 
+#[cfg(test)]
+mod am_tests {
+    use super::*;
+    use crate::backend::MemoryBackend;
+    use crate::model::SourceInfo;
+
+    #[test]
+    fn unauthenticated_apple_music_source_row_has_token_login_status() {
+        let tmp = std::env::temp_dir().join(format!("mineral-am-source-test-{}.json", std::process::id()));
+        let mut session = Session::open(MemoryBackend::default(), tmp);
+        session.sources = vec![
+            SourceInfo {
+                id: "am".to_owned(),
+                label: "Apple Music".to_owned(),
+                available: true,
+                logged_in: false,
+                searchable: vec!["song".to_owned()],
+            },
+        ];
+        let rows = session.library_rows();
+        let am_row = rows.iter().find(|r| r.key == "source:am").expect("source:am row");
+        assert_eq!(am_row.subtitle, "Not logged in · Click for Token Login");
+    }
+}

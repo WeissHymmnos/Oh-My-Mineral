@@ -65,6 +65,7 @@ WantedBy=default.target
 
 def find_mineral_daemon() -> Path:
     candidates = [
+        ROOT.parent / "Mineral" / "target" / "release" / "mineral",
         Path.home() / ".cargo" / "bin" / "mineral",
         Path("/usr/bin/mineral"),
         Path("/usr/local/bin/mineral"),
@@ -72,6 +73,17 @@ def find_mineral_daemon() -> Path:
     which_p = shutil.which("mineral")
     if which_p:
         candidates.insert(0, Path(which_p))
+    for c in candidates:
+        if c.is_file():
+            try:
+                out = subprocess.run([str(c), "--version"], capture_output=True, text=True, timeout=3).stdout
+                if "0.6." in out:
+                    return c
+            except Exception:
+                pass
+    bridge_bin = ROOT / "target" / "release" / "mineral-gui-bridge"
+    if bridge_bin.is_file():
+        return bridge_bin
     for c in candidates:
         if c.is_file():
             return c

@@ -1,0 +1,21 @@
+[package]
+name = "mineral-playback"
+description = "Playback provider、media preparation 与 decoder-ready media contract"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "1"
+parking_lot = "0.12"
+rangemap = "1.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rustc-hash = "2"
+symphonia-core = "0.6.1"
+tempfile = "3"
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+url = { version = "2", features = ["serde"] }

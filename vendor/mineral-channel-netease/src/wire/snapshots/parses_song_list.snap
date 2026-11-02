@@ -1,0 +1,51 @@
+---
+source: crates/mineral-channel/netease/src/wire/search.rs
+description: 搜索歌曲列表(MyGO 迷星叫 tns=null+alia / 碧天伴走 tns=null 无 alia)解析结构
+expression: r
+---
+CloudSongsResult {
+    songs: [
+        AlbumSong {
+            id: 1,
+            name: "迷星叫",
+            tns: [],
+            alia: [
+                "Mayoiuta",
+            ],
+            ar: [
+                Artist {
+                    id: 1,
+                    name: "MyGO!!!!!",
+                },
+            ],
+            al: Album {
+                id: 1,
+                name: "迷跡波",
+                pic_url: Some(
+                    "https://p1.music.126.net/x.jpg",
+                ),
+            },
+            dt: 211373,
+            privilege: None,
+        },
+        AlbumSong {
+            id: 2,
+            name: "碧天伴走",
+            tns: [],
+            alia: [],
+            ar: [
+                Artist {
+                    id: 1,
+                    name: "MyGO!!!!!",
+                },
+            ],
+            al: Album {
+                id: 1,
+                name: "迷跡波",
+                pic_url: None,
+            },
+            dt: 256000,
+            privilege: None,
+        },
+    ],
+}

@@ -1,0 +1,15 @@
+[package]
+name = "mineral-config"
+description = "Mineral daemon/TUI 共用的 Lua 配置求值、合并与字段诊断"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+thiserror = "1"
+mlua = { version = "0.10", features = ["lua54", "vendored", "serialize", "send"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_path_to_error = "0.1"
+num-traits = "0.2"
+mineral-log = { path = "../mineral-log", version = "0.6.0" }

@@ -1,0 +1,19 @@
+[package]
+name = "mineral-channel-core"
+description = "MusicChannel trait + 共享错误 / 类型"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+async-stream = "0.3"
+futures-util = "0.3"
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1"
+thiserror = "1"
+rustc-hash = "2"
+serde = { version = "1.0", features = ["derive"] }
+typed-builder = "0.20"
+derive-getters = "0.5"
+url = { version = "2", features = ["serde"] }

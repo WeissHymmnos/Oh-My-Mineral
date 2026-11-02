@@ -7,7 +7,7 @@ pub fn default_daemon_lua_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join("mineral").join("daemon.lua");
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         return PathBuf::from(home)
             .join(".config")
             .join("mineral")
@@ -23,6 +23,7 @@ pub struct DaemonConfigData {
     pub audio_backend: String,
     pub audio_playback_quality: String,
     pub audio_engine_tick_ms: u64,
+    pub audio_pcm_buffer_ms: u64,
     pub audio_prefetch_bytes: u64,
     pub audio_tap_capacity: usize,
     pub audio_envelope_points: usize,
@@ -46,6 +47,16 @@ pub struct DaemonConfigData {
     pub download_tagging_workers: usize,
 
     // 4. Sources (`sources.*`)
+    pub sources_am_timeout_secs: u64,
+    pub sources_am_proxy: Option<String>,
+    pub sources_am_developer_token_cache_ttl_days: u32,
+    pub sources_am_lyrics_translation_language: String,
+    pub sources_am_lyrics_romanization_script: String,
+    pub sources_am_album_cache_ttl_days: u32,
+    pub sources_am_album_cache_ttl_jitter_days: u32,
+    pub sources_am_media_concurrency: usize,
+    pub sources_am_startup_buffer_secs: u64,
+    pub sources_am_fragment_header_prefetch_bytes: u64,
     pub sources_local_roots: Vec<String>,
     pub sources_mineral_backfill_chunk_size: usize,
     pub sources_mineral_backfill_max_concurrent: usize,
@@ -99,6 +110,7 @@ impl Default for DaemonConfigData {
             audio_backend: "auto".to_owned(),
             audio_playback_quality: "exhigh".to_owned(),
             audio_engine_tick_ms: 20,
+            audio_pcm_buffer_ms: 200,
             audio_prefetch_bytes: 256 * 1024,
             audio_tap_capacity: 8192,
             audio_envelope_points: 200,
@@ -119,6 +131,16 @@ impl Default for DaemonConfigData {
             download_tagging: true,
             download_tagging_workers: 4,
 
+            sources_am_timeout_secs: 100,
+            sources_am_proxy: None,
+            sources_am_developer_token_cache_ttl_days: 30,
+            sources_am_lyrics_translation_language: "zh-hans-cn".to_owned(),
+            sources_am_lyrics_romanization_script: "ja-Latn".to_owned(),
+            sources_am_album_cache_ttl_days: 30,
+            sources_am_album_cache_ttl_jitter_days: 7,
+            sources_am_media_concurrency: 16,
+            sources_am_startup_buffer_secs: 10,
+            sources_am_fragment_header_prefetch_bytes: 16 * 1024,
             sources_local_roots: Vec::new(),
             sources_mineral_backfill_chunk_size: 40,
             sources_mineral_backfill_max_concurrent: 3,
@@ -135,7 +157,7 @@ impl Default for DaemonConfigData {
             sources_bilibili_proxy: None,
             sources_bilibili_max_connections: 0,
 
-            gapless_prefetch_ms: 10000,
+            gapless_prefetch_ms: 20000,
             prev_restart_threshold_ms: 3000,
             player_tick_ms: 20,
             session_save_secs: 15,
@@ -452,6 +474,9 @@ impl DaemonConfigData {
             "audio.engine_tick_ms" => {
                 self.audio_engine_tick_ms = raw_val.parse::<u64>().map_err(|_| "Invalid integer")?.max(1);
             }
+            "audio.pcm_buffer_ms" => {
+                self.audio_pcm_buffer_ms = raw_val.parse::<u64>().map_err(|_| "Invalid integer")?.max(20);
+            }
             "audio.prefetch_bytes" => {
                 self.audio_prefetch_bytes = parse_byte_size(raw_val).ok_or("Invalid byte size")?;
             }
@@ -518,6 +543,41 @@ impl DaemonConfigData {
             }
             "download.tagging_workers" => {
                 self.download_tagging_workers = raw_val.parse::<usize>().map_err(|_| "Invalid integer")?.max(1);
+            }
+            "sources.am.timeout_secs" => {
+                self.sources_am_timeout_secs = raw_val.parse::<u64>().map_err(|_| "Invalid integer")?.max(1);
+            }
+            "sources.am.proxy" => {
+                let t = raw_val.trim();
+                if t.is_empty() || t == "false" || t == "nil" || t == "off" || t == "direct" {
+                    self.sources_am_proxy = None;
+                } else {
+                    self.sources_am_proxy = Some(str_or_raw());
+                }
+            }
+            "sources.am.developer_token_cache_ttl_days" => {
+                self.sources_am_developer_token_cache_ttl_days = raw_val.parse::<u32>().map_err(|_| "Invalid integer")?.max(1);
+            }
+            "sources.am.lyrics_translation_language" => {
+                self.sources_am_lyrics_translation_language = str_or_raw();
+            }
+            "sources.am.lyrics_romanization_script" => {
+                self.sources_am_lyrics_romanization_script = str_or_raw();
+            }
+            "sources.am.album_cache.ttl_days" => {
+                self.sources_am_album_cache_ttl_days = raw_val.parse::<u32>().map_err(|_| "Invalid integer")?;
+            }
+            "sources.am.album_cache.ttl_jitter_days" => {
+                self.sources_am_album_cache_ttl_jitter_days = raw_val.parse::<u32>().map_err(|_| "Invalid integer")?;
+            }
+            "sources.am.media_concurrency" => {
+                self.sources_am_media_concurrency = raw_val.parse::<usize>().map_err(|_| "Invalid integer")?.max(1);
+            }
+            "sources.am.startup_buffer_secs" => {
+                self.sources_am_startup_buffer_secs = raw_val.parse::<u64>().map_err(|_| "Invalid integer")?.max(1);
+            }
+            "sources.am.fragment_header_prefetch_bytes" => {
+                self.sources_am_fragment_header_prefetch_bytes = parse_byte_size(raw_val).ok_or("Invalid byte size")?;
             }
             "sources.local.roots" => {
                 self.sources_local_roots = parse_lua_string_array(raw_val);
@@ -738,6 +798,7 @@ impl DaemonConfigData {
             "audio.backend" => self.audio_backend.clone(),
             "audio.playback_quality" => self.audio_playback_quality.clone(),
             "audio.engine_tick_ms" => self.audio_engine_tick_ms.to_string(),
+            "audio.pcm_buffer_ms" => self.audio_pcm_buffer_ms.to_string(),
             "audio.prefetch_bytes" => self.audio_prefetch_bytes.to_string(),
             "audio.tap_capacity" => self.audio_tap_capacity.to_string(),
             "audio.envelope.points" => self.audio_envelope_points.to_string(),
@@ -755,6 +816,16 @@ impl DaemonConfigData {
             "download.max_concurrent" => self.download_max_concurrent.to_string(),
             "download.tagging" => self.download_tagging.to_string(),
             "download.tagging_workers" => self.download_tagging_workers.to_string(),
+            "sources.am.timeout_secs" => self.sources_am_timeout_secs.to_string(),
+            "sources.am.proxy" => self.sources_am_proxy.clone().unwrap_or_else(|| "false".to_owned()),
+            "sources.am.developer_token_cache_ttl_days" => self.sources_am_developer_token_cache_ttl_days.to_string(),
+            "sources.am.lyrics_translation_language" => self.sources_am_lyrics_translation_language.clone(),
+            "sources.am.lyrics_romanization_script" => self.sources_am_lyrics_romanization_script.clone(),
+            "sources.am.album_cache.ttl_days" => self.sources_am_album_cache_ttl_days.to_string(),
+            "sources.am.album_cache.ttl_jitter_days" => self.sources_am_album_cache_ttl_jitter_days.to_string(),
+            "sources.am.media_concurrency" => self.sources_am_media_concurrency.to_string(),
+            "sources.am.startup_buffer_secs" => self.sources_am_startup_buffer_secs.to_string(),
+            "sources.am.fragment_header_prefetch_bytes" => self.sources_am_fragment_header_prefetch_bytes.to_string(),
             "sources.local.roots" => self.sources_local_roots.join(", "),
             "sources.mineral.backfill.chunk_size" => self.sources_mineral_backfill_chunk_size.to_string(),
             "sources.mineral.backfill.max_concurrent" => self.sources_mineral_backfill_max_concurrent.to_string(),
@@ -817,6 +888,10 @@ impl DaemonConfigData {
                 .collect();
             format!("{{ {} }}", quoted.join(", "))
         };
+        let am_proxy_lua = match &self.sources_am_proxy {
+            Some(p) if !p.trim().is_empty() && p.trim() != "false" => quote_lua_str(p.trim()),
+            _ => "false".to_owned(),
+        };
         let netease_proxy_lua = match &self.sources_netease_proxy {
             Some(p) if !p.trim().is_empty() && p.trim() != "false" => quote_lua_str(p.trim()),
             _ => "false".to_owned(),
@@ -865,6 +940,7 @@ impl DaemonConfigData {
              \x20       backend = {audio_backend},\n\
              \x20       playback_quality = {audio_playback_quality},\n\
              \x20       engine_tick_ms = {audio_engine_tick_ms},\n\
+             \x20       pcm_buffer_ms = {audio_pcm_buffer_ms},\n\
              \x20       prefetch_bytes = {audio_prefetch_bytes},\n\
              \x20       tap_capacity = {audio_tap_capacity},\n\
              \x20       envelope = {{\n\
@@ -897,6 +973,21 @@ impl DaemonConfigData {
              \x20   }},\n\
              \n\
              \x20   sources = {{\n\
+             \x20       am = {{\n\
+             \x20           timeout_secs = {sources_am_timeout_secs},\n\
+             \x20           proxy = {am_proxy_lua},\n\
+             \x20           developer_token_cache_ttl_days = {sources_am_developer_token_cache_ttl_days},\n\
+             \x20           lyrics_translation_language = {sources_am_lyrics_translation_language},\n\
+             \x20           lyrics_romanization_script = {sources_am_lyrics_romanization_script},\n\
+             \x20           album_cache = {{\n\
+             \x20               ttl_days = {sources_am_album_cache_ttl_days},\n\
+             \x20               ttl_jitter_days = {sources_am_album_cache_ttl_jitter_days},\n\
+             \x20           }},\n\
+             \x20           device_file = nil,\n\
+             \x20           media_concurrency = {sources_am_media_concurrency},\n\
+             \x20           startup_buffer_secs = {sources_am_startup_buffer_secs},\n\
+             \x20           fragment_header_prefetch_bytes = {sources_am_fragment_header_prefetch_bytes},\n\
+             \x20       }},\n\
              \x20       [\"local\"] = {{\n\
              \x20           roots = {local_roots_lua},\n\
              \x20       }},\n\
@@ -963,6 +1054,7 @@ impl DaemonConfigData {
             audio_backend = quote_lua_str(&self.audio_backend),
             audio_playback_quality = quote_lua_str(&self.audio_playback_quality),
             audio_engine_tick_ms = self.audio_engine_tick_ms,
+            audio_pcm_buffer_ms = self.audio_pcm_buffer_ms,
             audio_prefetch_bytes = self.audio_prefetch_bytes,
             audio_tap_capacity = self.audio_tap_capacity,
             audio_envelope_points = self.audio_envelope_points,
@@ -980,6 +1072,16 @@ impl DaemonConfigData {
             download_max_concurrent = self.download_max_concurrent,
             download_tagging = self.download_tagging,
             download_tagging_workers = self.download_tagging_workers,
+            sources_am_timeout_secs = self.sources_am_timeout_secs,
+            am_proxy_lua = am_proxy_lua,
+            sources_am_developer_token_cache_ttl_days = self.sources_am_developer_token_cache_ttl_days,
+            sources_am_lyrics_translation_language = quote_lua_str(&self.sources_am_lyrics_translation_language),
+            sources_am_lyrics_romanization_script = quote_lua_str(&self.sources_am_lyrics_romanization_script),
+            sources_am_album_cache_ttl_days = self.sources_am_album_cache_ttl_days,
+            sources_am_album_cache_ttl_jitter_days = self.sources_am_album_cache_ttl_jitter_days,
+            sources_am_media_concurrency = self.sources_am_media_concurrency,
+            sources_am_startup_buffer_secs = self.sources_am_startup_buffer_secs,
+            sources_am_fragment_header_prefetch_bytes = self.sources_am_fragment_header_prefetch_bytes,
             local_roots_lua = local_roots_lua,
             sources_mineral_backfill_chunk_size = self.sources_mineral_backfill_chunk_size,
             sources_mineral_backfill_max_concurrent = self.sources_mineral_backfill_max_concurrent,
@@ -1076,7 +1178,14 @@ impl DaemonConfigData {
             "action|daemon_config_reset".to_owned(),
         ));
 
-        // ── Section 0.5: Online Source Accounts (QR Code Login) ──
+        // ── Section 0.5: Online Source Accounts (QR / Token Login) ──
+        items.push(mk(
+            "settings:login:am",
+            "Account · Apple Music Token Login",
+            "Click to enter media-user-token cookie from music.apple.com",
+            "Validates account, saves credentials & reloads daemon",
+            "action|token_login_am".to_owned(),
+        ));
         items.push(mk(
             "settings:login:netease",
             "Account · NetEase Cloud Music QR Login",
@@ -1124,6 +1233,13 @@ impl DaemonConfigData {
             &format!("{} ms", self.audio_engine_tick_ms),
             "audio.engine_tick_ms (default 20 ms)",
             format!("int|{}", self.audio_engine_tick_ms),
+        ));
+        items.push(mk(
+            "settings:daemon:audio.pcm_buffer_ms",
+            "Audio · PCM Ring Buffer Duration",
+            &format!("{} ms", self.audio_pcm_buffer_ms),
+            "audio.pcm_buffer_ms (default 200 ms)",
+            format!("int|{}", self.audio_pcm_buffer_ms),
         ));
         items.push(mk(
             "settings:daemon:audio.prefetch_bytes",
@@ -1255,6 +1371,55 @@ impl DaemonConfigData {
         ));
 
         // ── Section 4: Sources (`sources.*`) ──
+        items.push(mk(
+            "settings:daemon:sources.am.timeout_secs",
+            "Source (Apple Music) · HTTP Timeout",
+            &format!("{} s", self.sources_am_timeout_secs),
+            "sources.am.timeout_secs (default 100 s)",
+            format!("int|{}", self.sources_am_timeout_secs),
+        ));
+        let am_proxy_disp = self
+            .sources_am_proxy
+            .as_deref()
+            .unwrap_or("false (Direct Connection)");
+        items.push(mk(
+            "settings:daemon:sources.am.proxy",
+            "Source (Apple Music) · Proxy Server",
+            am_proxy_disp,
+            "sources.am.proxy (false or http/socks5 URL)",
+            format!(
+                "proxy|{}",
+                self.sources_am_proxy.as_deref().unwrap_or("false")
+            ),
+        ));
+        items.push(mk(
+            "settings:daemon:sources.am.lyrics_translation_language",
+            "Source (Apple Music) · Lyrics Translation Language",
+            &self.sources_am_lyrics_translation_language,
+            "sources.am.lyrics_translation_language (default zh-hans-cn)",
+            format!("text|{}", self.sources_am_lyrics_translation_language),
+        ));
+        items.push(mk(
+            "settings:daemon:sources.am.lyrics_romanization_script",
+            "Source (Apple Music) · Lyrics Romanization Script",
+            &self.sources_am_lyrics_romanization_script,
+            "sources.am.lyrics_romanization_script (default ja-Latn)",
+            format!("text|{}", self.sources_am_lyrics_romanization_script),
+        ));
+        items.push(mk(
+            "settings:daemon:sources.am.media_concurrency",
+            "Source (Apple Music) · Media Segment Concurrency",
+            &format!("{} streams", self.sources_am_media_concurrency),
+            "sources.am.media_concurrency (default 16)",
+            format!("int|{}", self.sources_am_media_concurrency),
+        ));
+        items.push(mk(
+            "settings:daemon:sources.am.startup_buffer_secs",
+            "Source (Apple Music) · Progressive Startup Buffer",
+            &format!("{} s", self.sources_am_startup_buffer_secs),
+            "sources.am.startup_buffer_secs (default 10 s)",
+            format!("int|{}", self.sources_am_startup_buffer_secs),
+        ));
         let local_roots_disp = if self.sources_local_roots.is_empty() {
             "None ({}) — Click to add local music folders".to_owned()
         } else {

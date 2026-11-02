@@ -1,0 +1,28 @@
+//! Mineral 异步任务调度库。
+//!
+//! 进程内库，使用方通过 `Scheduler::new` 注入来源、worker 数和存储，在自己进程里
+//! 提交 / 取消 / 拉事件。库本身不知道使用方是 TUI 还是 daemon。
+//!
+//! 入口:[`Scheduler`]。
+
+mod event;
+mod handle;
+mod id;
+mod kind;
+mod lanes;
+mod ongoing;
+mod outcome;
+mod scheduler;
+mod write;
+
+pub use event::{SearchPayload, TaskEvent};
+mod search;
+pub use handle::TaskHandle;
+pub use id::Priority;
+pub use kind::{ChannelFetchKind, ChannelFetchKindTag, DedupKey, TaskKind};
+pub use lanes::channel_fetch::DispatchError;
+pub use outcome::TaskOutcome;
+pub use scheduler::{ChannelRunError, Scheduler, Snapshot};
+pub use search::{SearchBatch, SearchStream};
+pub use write::{PlaylistWriteOp, WriteError};
+mod read_cache;

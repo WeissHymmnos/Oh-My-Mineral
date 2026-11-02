@@ -2,11 +2,18 @@
 
 use std::sync::Arc;
 
-use mineral_protocol::{SessionMessage, SubscribeRequest, SubscriptionId, SubscriptionTopic};
+use mineral_model::{CollectionCategory, RefreshScope};
+use mineral_protocol::{
+    AdvanceSubscription, SessionMessage, SubscribeRequest, Subscription, SubscriptionId,
+    SubscriptionTopic,
+};
 use rustc_hash::FxHashMap;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use super::artist_albums::pump_artist_albums;
+use super::playlist::pump_playlist;
+use super::search::pump_search;
 use super::session::SessionServices;
 use super::updates::{
     pump_downloads_detail, pump_downloads_summary, pump_events, pump_pcm, pump_playback,
@@ -17,6 +24,9 @@ use crate::pcm_relay::{PcmRelay, PcmSubscription};
 
 /// 订阅泵句柄。
 struct Pump {
+    /// Retained to stop affected reads before acknowledging a refresh.
+    topic: SubscriptionTopic,
+
     /// 泵任务。
     handle: JoinHandle<()>,
 
@@ -25,6 +35,12 @@ struct Pump {
 
     /// PCM 订阅令牌(退订时归还中继)。
     pcm: Option<PcmSubscription>,
+
+    /// Flush already-published task results into the session's ordered output before an ack.
+    flush_events: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
+
+    /// Demand for a stream owned by this pump; dropping the pump drops the stream.
+    advance: Option<mpsc::UnboundedSender<AdvanceSubscription>>,
 }
 
 /// 一条连接的订阅登记。
@@ -58,7 +74,57 @@ impl Subscriptions {
             return;
         }
         let resync = Arc::new(Notify::new());
-        let (handle, pcm) = match request.topic {
+        let mut flush_events = None;
+        let mut advance = None;
+        let (handle, pcm) = match &request.topic {
+            SubscriptionTopic::ArtistAlbums(id) => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                advance = Some(tx);
+                (
+                    tokio::spawn(pump_artist_albums(
+                        client.clone(),
+                        request.id,
+                        id.clone(),
+                        rx,
+                        out.clone(),
+                    )),
+                    None,
+                )
+            }
+            SubscriptionTopic::Search {
+                source,
+                kind,
+                query,
+            } => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                advance = Some(tx);
+                (
+                    tokio::spawn(pump_search(
+                        client.clone(),
+                        request.id,
+                        *source,
+                        *kind,
+                        query.clone(),
+                        rx,
+                        out.clone(),
+                    )),
+                    None,
+                )
+            }
+            SubscriptionTopic::Playlist(id) => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                advance = Some(tx);
+                (
+                    tokio::spawn(pump_playlist(
+                        client.clone(),
+                        request.id,
+                        id.clone(),
+                        rx,
+                        out.clone(),
+                    )),
+                    None,
+                )
+            }
             SubscriptionTopic::Player => {
                 let known = request.known_player.unwrap_or_default();
                 let handle = tokio::spawn(pump_player(
@@ -110,12 +176,17 @@ impl Subscriptions {
                 (handle, Some(token))
             }
             SubscriptionTopic::Events(category) => {
+                let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+                if *category == Subscription::Task {
+                    flush_events = Some(flush_tx);
+                }
                 let handle = tokio::spawn(pump_events(
                     services.publishers.events(),
-                    category,
+                    *category,
                     request.id,
                     client.clone(),
                     out.clone(),
+                    flush_rx,
                 ));
                 (handle, None)
             }
@@ -123,11 +194,26 @@ impl Subscriptions {
         self.pumps.insert(
             request.id,
             Pump {
+                topic: request.topic.clone(),
                 handle,
                 resync,
                 pcm,
+                flush_events,
+                advance,
             },
         );
+    }
+
+    /// Acknowledgements must not overtake results waiting in a task subscription's broadcast receiver.
+    pub(super) async fn flush_task_events(&self) {
+        for pump in self.pumps.values() {
+            if let Some(flush) = &pump.flush_events {
+                let (done, waiting) = oneshot::channel();
+                if flush.send(done).is_ok() {
+                    let _ = waiting.await;
+                }
+            }
+        }
     }
 
     /// 取消订阅。
@@ -152,6 +238,42 @@ impl Subscriptions {
     pub(super) fn resync(&self, id: SubscriptionId) {
         if let Some(pump) = self.pumps.get(&id) {
             pump.resync.notify_one();
+        }
+    }
+
+    pub(super) fn advance(&self, request: AdvanceSubscription) {
+        if let Some(sender) = self
+            .pumps
+            .get(&request.subscription)
+            .and_then(|pump| pump.advance.as_ref())
+        {
+            let _ = sender.send(request);
+        }
+    }
+
+    /// Stops affected streams before cache invalidation; awaiting abort drops an in-flight poll.
+    pub(super) async fn invalidate(&mut self, scope: &RefreshScope) {
+        let ids = self
+            .pumps
+            .iter()
+            .filter_map(|(subscription, pump)| match (&pump.topic, scope) {
+                (
+                    SubscriptionTopic::Playlist(_),
+                    RefreshScope::Collections(CollectionCategory::Playlists),
+                ) => Some(*subscription),
+                (SubscriptionTopic::Playlist(id), RefreshScope::Playlist(target))
+                    if id == target =>
+                {
+                    Some(*subscription)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(pump) = self.pumps.remove(&id) {
+                pump.handle.abort();
+                let _ = pump.handle.await;
+            }
         }
     }
 

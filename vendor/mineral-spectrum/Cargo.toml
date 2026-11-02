@@ -1,0 +1,11 @@
+[package]
+name = "mineral-spectrum"
+description = "音频频谱分析(realfft + 对数桶映射)"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+derive-getters = "0.5"
+realfft = "3"
+typed-builder = "0.20"

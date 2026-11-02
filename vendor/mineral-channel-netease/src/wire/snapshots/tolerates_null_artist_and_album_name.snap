@@ -1,0 +1,23 @@
+---
+source: crates/mineral-channel/netease/src/wire/search.rs
+description: "搜索列表容错:null artist 跳过 + null album 名 → 空串"
+expression: r
+---
+CloudSongsResult {
+    songs: [
+        AlbumSong {
+            id: 1,
+            name: "n",
+            tns: [],
+            alia: [],
+            ar: [],
+            al: Album {
+                id: 1,
+                name: "",
+                pic_url: None,
+            },
+            dt: 0,
+            privilege: None,
+        },
+    ],
+}

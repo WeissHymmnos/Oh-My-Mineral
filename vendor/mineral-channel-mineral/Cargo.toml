@@ -1,0 +1,11 @@
+[package]
+name = "mineral-channel-mineral"
+description = "Mineral 内建来源的 channel：跨来源收藏歌单视图"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+mineral-channel-core = { path = "../mineral-channel-core", version = "0.6.0" }
+async-trait = "0.1"

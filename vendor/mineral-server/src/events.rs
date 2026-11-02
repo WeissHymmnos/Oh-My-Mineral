@@ -28,6 +28,7 @@ impl PlayerCore {
     /// 一次 drain:把 TaskEvent 分类——LyricsReady 内部消化、PlaylistWriteDone 成功先收敛缓存、
     /// 其余通过 event hub 推给订阅 client。
     pub(crate) fn consume_events_once(&self) {
+        let _publication = self.inner.collection_publication.lock();
         let events = self.inner.scheduler.drain_events();
         if events.is_empty() {
             return;
@@ -41,7 +42,7 @@ impl PlayerCore {
                 // 逐源列表进聚合态,client 只见出口变换后的合并快照
                 // (LibrarySnapshot,由管线异步推)。
                 TaskEvent::PlaylistsFetched { source, playlists } => {
-                    self.library_concluded(source, Some(playlists));
+                    self.library_concluded(source, Some(playlists), self.library_generation());
                 }
                 TaskEvent::AlbumsFetched { source, albums } => {
                     let albums = self.library().replace_saved_albums(source, albums);
@@ -51,19 +52,19 @@ impl PlayerCore {
                     source,
                     kind,
                     query,
-                    page,
+                    batch,
                     payload,
-                    has_more,
+                    complete,
                 } => {
-                    // source/kind/page 是 Copy,记录后原样转发给 client。
-                    self.record_search_result(source, kind, &query, page, &payload);
+                    // 记录搜索批次后原样转发给 client。
+                    self.record_search_result(source, kind, &query, batch, &payload);
                     forward.push(TaskEvent::SearchResults {
                         source,
                         kind,
                         query,
-                        page,
+                        batch,
                         payload,
-                        has_more,
+                        complete,
                     });
                 }
                 // 纯埋点信号:记 fetches 后**不转发**(client 不消费)。
@@ -99,20 +100,17 @@ impl PlayerCore {
         match op {
             PlaylistWriteOp::AddSongs { id, .. } | PlaylistWriteOp::RemoveSongs { id, .. } => {
                 self.inner.scheduler.submit(
-                    TaskKind::ChannelFetch(ChannelFetchKind::PlaylistDetail {
-                        id: id.clone(),
-                        load: mineral_channel_core::PlaylistLoad::Complete,
-                    }),
+                    TaskKind::ChannelFetch(ChannelFetchKind::PlaylistDetail { id: id.clone() }),
                     Priority::User,
                 );
             }
             PlaylistWriteOp::Create { source, .. } => {
-                self.submit_my_playlists(*source);
+                self.submit_my_playlists_locked(*source);
             }
             PlaylistWriteOp::Delete { id }
             | PlaylistWriteOp::Rename { id, .. }
             | PlaylistWriteOp::SetDescription { id, .. } => {
-                self.submit_my_playlists(id.namespace());
+                self.submit_my_playlists_locked(id.namespace());
             }
         }
     }
@@ -207,14 +205,14 @@ impl PlayerCore {
     ///   - `source`: 搜索来源
     ///   - `kind`: 搜索实体类型
     ///   - `query`: 搜索词原文(记录侧据 search_queries 档决定原文 / 散列 / 不记)
-    ///   - `page`: 分页参数(页码 = offset / limit)
+    ///   - `batch`: 当前搜索中从零开始的批次序号
     ///   - `payload`: 结果载荷(取条数)
     pub(crate) fn record_search_result(
         &self,
         source: mineral_model::SourceKind,
         kind: mineral_model::SearchKind,
         query: &str,
-        page: mineral_channel_core::Page,
+        batch: u64,
         payload: &mineral_task::SearchPayload,
     ) {
         use mineral_model::SearchKind;
@@ -232,7 +230,7 @@ impl PlayerCore {
             SearchPayload::Playlists(v) => v.len(),
             SearchPayload::Artists(v) => v.len(),
         };
-        let page_no = i64::from(page.offset.checked_div(page.limit).unwrap_or(0));
+        let page_no = i64::try_from(batch).unwrap_or(i64::MAX);
         self.inner.stats.record_search(
             mineral_stats::Actor::User,
             query,

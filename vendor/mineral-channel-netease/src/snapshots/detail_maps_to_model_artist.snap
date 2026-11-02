@@ -1,0 +1,121 @@
+---
+source: crates/mineral-channel/netease/src/convert.rs
+description: artist 详情映射成统一 Artist(Beyond + 1 热门曲)
+expression: model
+---
+Artist {
+    id: ArtistId {
+        namespace: netease,
+        value: IdString(
+            "11127",
+        ),
+    },
+    name: "Beyond",
+    description: "香港摇滚乐队",
+    follower_count: Some(
+        8900000,
+    ),
+    album_count: Some(
+        146,
+    ),
+    song_count: Some(
+        2570,
+    ),
+    avatar_url: Some(
+        Remote(
+            Url {
+                scheme: "https",
+                cannot_be_a_base: false,
+                username: "",
+                password: None,
+                host: Some(
+                    Domain(
+                        "p1.music.126.net",
+                    ),
+                ),
+                port: None,
+                path: "/x.jpg",
+                query: None,
+                fragment: None,
+            },
+        ),
+    ),
+    web_url: Some(
+        Url {
+            scheme: "https",
+            cannot_be_a_base: false,
+            username: "",
+            password: None,
+            host: Some(
+                Domain(
+                    "music.163.com",
+                ),
+            ),
+            port: None,
+            path: "/artist",
+            query: Some(
+                "id=11127",
+            ),
+            fragment: None,
+        },
+    ),
+    songs: [
+        Song {
+            id: SongId {
+                namespace: netease,
+                value: IdString(
+                    "1",
+                ),
+            },
+            name: "海阔天空",
+            alias: None,
+            artists: [
+                ArtistRef {
+                    id: ArtistId {
+                        namespace: netease,
+                        value: IdString(
+                            "11127",
+                        ),
+                    },
+                    name: "Beyond",
+                },
+            ],
+            album: Some(
+                AlbumRef {
+                    id: AlbumId {
+                        namespace: netease,
+                        value: IdString(
+                            "9",
+                        ),
+                    },
+                    name: "乐与怒",
+                },
+            ),
+            duration_ms: Some(
+                323000,
+            ),
+            cover_url: None,
+            web_url: Some(
+                Url {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "music.163.com",
+                        ),
+                    ),
+                    port: None,
+                    path: "/song",
+                    query: Some(
+                        "id=1",
+                    ),
+                    fragment: None,
+                },
+            ),
+            source_url: None,
+            unavailable: false,
+        },
+    ],
+}

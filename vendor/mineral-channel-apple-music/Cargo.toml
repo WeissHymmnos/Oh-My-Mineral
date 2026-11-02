@@ -1,0 +1,51 @@
+[package]
+name = "mineral-channel-apple-music"
+description = "Apple Music catalog and personal library source"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+async-stream = "0.3"
+symphonia = { version = "0.6.1", default-features = false, features = ["isomp4", "all-meta"] }
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+mineral-channel-core = { path = "../mineral-channel-core", version = "0.6.0" }
+mineral-playback = { path = "../mineral-playback", version = "0.6.0" }
+mineral-paths = { path = "../mineral-paths", version = "0.6.0" }
+mineral-log = { path = "../mineral-log", version = "0.6.0" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.45.1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+url = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rustc-hash = "2"
+thiserror = "1"
+typed-builder = "0.20"
+derive-getters = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+tempfile = "3"
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+indicatif = "0.18"
+base64 = "0.22"
+regex = "1"
+roxmltree = "0.21"
+html2text = { version = "0.17", default-features = false }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = "0.10"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+parking_lot = "0.12"
+byteorder = "1.5"
+cmac = "0.7"
+ctr = "0.9"
+hmac = "0.12"
+hls_m3u8 = "0.7"
+prost = "0.14"
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha1"] }
+sha1 = "0.10"
+shiguredo_mp4 = "2026.5"
+zeroize = "1"

@@ -1,0 +1,249 @@
+use std::sync::Mutex;
+use std::time::Duration;
+
+use isahc::{
+    AsyncReadResponseExt, HttpClient, Request, config::Configurable, cookies::CookieJar, http::Uri,
+};
+
+use crate::{Error, Result};
+
+use crate::config::NeteaseConfig;
+use crate::crypto::{eapi, linuxapi, weapi};
+use crate::error::ApiCodeError;
+use crate::request::RequestPolicy;
+use crate::transport::body::{decode_response, parse_code};
+use crate::transport::headers::{UA_LINUX, UaKind, pick_user_agent};
+use crate::transport::url::{Crypto, rewrite};
+
+/// 网易云 API 根 URL,所有请求都拼在此基础上。
+const BASE_URL: &str = "https://music.163.com";
+
+/// 一次请求的输入。
+pub struct RequestSpec<'a> {
+    /// service 写的逻辑路径(`/weapi/...` / `/eapi/...` / `/api/...`),URL 改写在内部完成。
+    pub path: &'a str,
+
+    /// 加密方案:决定路径改写、body 编码、UA 选择策略。
+    pub crypto: Crypto,
+
+    /// 业务参数;weapi/eapi 时本层会自动注入 `csrf_token`。
+    pub params: serde_json::Map<String, serde_json::Value>,
+
+    /// UA 选择(`Any` 时按设备指纹随机,`Linux`/`Pc` 时强制对应 UA)。
+    pub ua: UaKind,
+}
+
+/// HTTP 传输层:封装 isahc 客户端 + 全局 cookie jar + 加密 dispatcher。
+pub struct Transport {
+    /// 底层 isahc 客户端,持有连接池 + cookie jar。
+    client: HttpClient,
+
+    /// 缓存的 `__csrf` 值,首次需要时从 cookie jar 读出并保存。
+    csrf: Mutex<String>,
+}
+
+impl Transport {
+    pub fn new(config: &NeteaseConfig) -> Result<Self> {
+        let mut builder = HttpClient::builder()
+            .timeout(Duration::from_secs(*config.timeout_secs()))
+            .max_connections(*config.max_connections())
+            .cookies();
+        if let Some(p) = config.proxy().as_deref() {
+            builder = builder.proxy(Some(p.parse().map_err(|source| Error::Network {
+                operation: "parse proxy URL",
+                source: Box::new(source),
+            })?));
+        }
+        let client = builder.build().map_err(|source| Error::Network {
+            operation: "build HTTP client",
+            source: Box::new(source),
+        })?;
+        Ok(Self {
+            client,
+            csrf: Mutex::new(String::new()),
+        })
+    }
+
+    pub fn from_cookie_jar(config: &NeteaseConfig, jar: CookieJar) -> Result<Self> {
+        let mut builder = HttpClient::builder()
+            .timeout(Duration::from_secs(*config.timeout_secs()))
+            .max_connections(*config.max_connections())
+            .cookies()
+            .cookie_jar(jar);
+        if let Some(p) = config.proxy().as_deref() {
+            builder = builder.proxy(Some(p.parse().map_err(|source| Error::Network {
+                operation: "parse proxy URL",
+                source: Box::new(source),
+            })?));
+        }
+        let client = builder.build().map_err(|source| Error::Network {
+            operation: "build HTTP client",
+            source: Box::new(source),
+        })?;
+        Ok(Self {
+            client,
+            csrf: Mutex::new(String::new()),
+        })
+    }
+
+    pub fn cookie_jar(&self) -> Option<&CookieJar> {
+        self.client.cookie_jar()
+    }
+
+    /// 直接走 dispatcher,跳过 `code != 200` 的检查;返回 (code, full_json)。
+    /// 用于联调 example —— 即使端点返回非 200 也想看到完整 body 排查。
+    pub async fn ping(&self, spec: RequestSpec<'_>) -> Result<(i64, serde_json::Value)> {
+        let v = self.request_lax(spec).await?;
+        let code = parse_code(&v)?;
+        Ok((code, v))
+    }
+
+    /// 拿 csrf,优先用缓存的;若空则从 cookie jar 里读 `__csrf` 并缓存。
+    fn csrf_token(&self) -> String {
+        {
+            let cached = self.csrf.lock().expect("csrf mutex poisoned");
+            if !cached.is_empty() {
+                return cached.clone();
+            }
+        }
+        if let Some(jar) = self.cookie_jar() {
+            let uri: Uri = BASE_URL.parse().unwrap();
+            if let Some(cookie) = jar.get_by_name(&uri, "__csrf") {
+                let val = cookie.value().to_string();
+                *self.csrf.lock().expect("csrf mutex poisoned") = val.clone();
+                return val;
+            }
+        }
+        String::new()
+    }
+
+    /// 发请求并返回解析后的 JSON Value;`code != 200` 时返回 `Err`。
+    pub async fn request(&self, spec: RequestSpec<'_>) -> Result<serde_json::Value> {
+        self.request_once(&spec, None, 1).await
+    }
+
+    /// 对调用方指定的读取端点执行限流退避；每次尝试都申请同一策略的发送额度。
+    pub(crate) async fn request_with_policy(
+        &self,
+        spec: RequestSpec<'_>,
+        policy: &RequestPolicy,
+    ) -> Result<serde_json::Value> {
+        policy
+            .retry(spec.path, |attempt| {
+                self.request_once(&spec, Some(policy), attempt)
+            })
+            .await
+    }
+
+    /// 检查单次请求的业务码；重试时保留网易原始结构化错误。
+    async fn request_once(
+        &self,
+        spec: &RequestSpec<'_>,
+        policy: Option<&RequestPolicy>,
+        attempt: usize,
+    ) -> Result<serde_json::Value> {
+        let endpoint = spec.path;
+        let value = self.request_lax_once(spec, policy, attempt).await?;
+        let code = parse_code(&value)?;
+        if code != 200 {
+            let message = value
+                .get("message")
+                .or_else(|| value.get("msg"))
+                .and_then(|v| v.as_str());
+            mineral_log::warn!(target: "channel_netease", endpoint, code, message, "api error");
+            return Err(ApiCodeError {
+                code,
+                message: message.map(str::to_owned),
+            }
+            .into());
+        }
+        Ok(value)
+    }
+
+    /// 发请求并返回解析后的 JSON,**不**因为 `code != 200` 报错。
+    /// 用于 `CheckQR` 等用 `code` 表达业务状态的端点。
+    pub async fn request_lax(&self, spec: RequestSpec<'_>) -> Result<serde_json::Value> {
+        self.request_lax_once(&spec, None, 1).await
+    }
+
+    /// 每次发送重新读取 csrf 并加密；仅在 HTTP 发送前消耗额度。
+    async fn request_lax_once(
+        &self,
+        spec: &RequestSpec<'_>,
+        policy: Option<&RequestPolicy>,
+        attempt: usize,
+    ) -> Result<serde_json::Value> {
+        let csrf = self.csrf_token();
+
+        // 注入 csrf_token 到 weapi/eapi 的 params(linuxapi 不注入)
+        let mut params = spec.params.clone();
+        if matches!(spec.crypto, Crypto::Weapi | Crypto::Eapi) {
+            params.insert("csrf_token".into(), serde_json::Value::String(csrf.clone()));
+        }
+
+        let url = rewrite(spec.path, spec.crypto);
+        let json_text = serde_json::to_string(&params)?;
+
+        let (ua, body) = match spec.crypto {
+            Crypto::Weapi => (pick_user_agent(spec.ua), weapi(&json_text)),
+            Crypto::Eapi => {
+                // EAPI 的摘要绑定 service 写的逻辑路径(`spec.path`),不是改写后的实际 URL。
+                (pick_user_agent(spec.ua), eapi(spec.path, &json_text))
+            }
+            Crypto::Linuxapi => {
+                // linuxapi 把 method+url+params 整个序列化进加密体
+                let payload = serde_json::json!({
+                    "method": "POST",
+                    "url": format!("{BASE_URL}/api{}", strip_api_prefix(spec.path)),
+                    "params": params,
+                });
+                (UA_LINUX, linuxapi(&payload.to_string()))
+            }
+        };
+
+        let req = Request::post(&url)
+            .header("Cookie", "os=pc; appver=2.7.1.198277; __remember_me=true")
+            .header("Accept", "*/*")
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Connection", "keep-alive")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Host", "music.163.com")
+            .header("Referer", BASE_URL)
+            .header("User-Agent", ua)
+            .body(body)
+            .map_err(|source| Error::Network {
+                operation: "build request",
+                source: Box::new(source),
+            })?;
+
+        if let Some(policy) = policy {
+            policy.wait_until_ready(spec.path, attempt).await;
+        }
+        mineral_log::debug!(target: "channel_netease", path = spec.path, crypto = ?spec.crypto, attempt, "request");
+        let mut resp = self
+            .client
+            .send_async(req)
+            .await
+            .map_err(|source| Error::Network {
+                operation: "send request",
+                source: Box::new(source),
+            })?;
+        let bytes = resp.bytes().await.map_err(|source| Error::Network {
+            operation: "read response body",
+            source: Box::new(source),
+        })?;
+
+        decode_response(bytes)
+    }
+}
+
+/// 把 service 写的 `/weapi/...` / `/api/...` / `/eapi/...` 前缀剥成 `/...`,
+/// 用于 linuxapi 拼装内部 url 字段。
+fn strip_api_prefix(path: &str) -> &str {
+    for prefix in ["/weapi", "/eapi", "/api"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    path
+}

@@ -7,13 +7,14 @@
 
 use std::sync::Arc;
 
-use mineral_model::SongId;
+use mineral_channel_core::finish_playlist;
+use mineral_model::{CachePolicy, SongId};
 use mineral_playback::PlaybackRequest;
 use mineral_protocol::{DownloadTarget, Event};
 use mineral_script::mlua::Lua;
 use mineral_script::{
     PlaylistBrief, QueryId, ResolveValue, ScriptCmd, ScriptHost, ScriptRuntime, ScriptSender,
-    SourceWebUrls, WatchdogConfig,
+    WatchdogConfig,
 };
 use num_traits::ToPrimitive;
 use tokio::sync::broadcast;
@@ -105,32 +106,12 @@ impl ScriptParts {
     ///
     /// # Params:
     ///   - `watchdog`: 回调看门狗参数(配置 `script` 段派生)
-    ///   - `channels`: 已注册音乐源(收集各源网页链接模板,seed 进 VM 供
-    ///     Song/Playlist 投影拼 `url`;热重载的新 VM 复用同一份)
     ///
     /// # Return:
     ///   `(runtime, rest)`:runtime 为 `None` 表示无脚本;rest 是泵 + 热重载接线件。
     #[must_use]
-    pub fn spawn_runtime(
-        self,
-        watchdog: WatchdogConfig,
-        channels: &[Arc<dyn mineral_channel_core::MusicChannel>],
-    ) -> (Option<ScriptRuntime>, ScriptPumps) {
-        let web_urls = channels
-            .iter()
-            .map(|ch| {
-                let caps = ch.caps();
-                SourceWebUrls {
-                    source: ch.source().name().to_owned(),
-                    song: caps.song_web_url().clone(),
-                    playlist: caps.playlist_web_url().clone(),
-                    album: caps.album_web_url().clone(),
-                    artist: caps.artist_web_url().clone(),
-                }
-            })
-            .collect::<Vec<SourceWebUrls>>();
+    pub fn spawn_runtime(self, watchdog: WatchdogConfig) -> (Option<ScriptRuntime>, ScriptPumps) {
         let runtime = self.vm.and_then(|lua| {
-            seed_web_urls(&lua, &web_urls);
             match ScriptRuntime::spawn(lua, self.host.clone(), watchdog, &self.sender) {
                 Ok(runtime) => Some(runtime),
                 Err(e) => {
@@ -151,20 +132,8 @@ impl ScriptParts {
                 cmd_tx: self.cmd_tx,
                 push_tx: self.push_tx,
                 watchdog,
-                web_urls,
             },
         )
-    }
-}
-
-/// 把各源网页链接模板 seed 进 VM;失败只降级(`url` 为 nil),不阻断脚本启动。
-pub(crate) fn seed_web_urls(lua: &Lua, web_urls: &[SourceWebUrls]) {
-    if let Err(e) = mineral_script::seed_web_url_templates(lua, web_urls.iter().cloned()) {
-        mineral_log::warn!(
-            target: "script",
-            error = mineral_log::chain(&e),
-            "网页链接模板 seed 失败,实体 url 字段降级为 nil"
-        );
     }
 }
 
@@ -184,9 +153,6 @@ pub struct ScriptPumps {
 
     /// 看门狗参数(热重载起新线程复用)。
     watchdog: WatchdogConfig,
-
-    /// 各源网页链接模板(热重载的新 VM 重新 seed 用;caps 启动后不变)。
-    web_urls: Vec<SourceWebUrls>,
 }
 
 /// `ScriptPumps::start` 拆出的热重载接线件(交给
@@ -200,9 +166,6 @@ pub struct ScriptReloadParts {
 
     /// 看门狗参数(重载起新线程用)。
     pub(crate) watchdog: WatchdogConfig,
-
-    /// 各源网页链接模板(重载的新 VM 重新 seed 用)。
-    pub(crate) web_urls: Vec<SourceWebUrls>,
 
     /// 配置底树落点:重载成功后把新合成树交给配置宿主(重算有效树 +
     /// 推送订阅 client)。
@@ -235,7 +198,6 @@ impl ScriptPumps {
             cmd_tx,
             push_tx,
             watchdog,
-            web_urls,
         } = self;
         // player 随后被泵任务 move 走,先留一份埋点句柄给重载器。
         let stats = player.inner.stats.clone();
@@ -280,7 +242,6 @@ impl ScriptPumps {
             cmd_tx,
             push_tx,
             watchdog,
-            web_urls,
             apply_config_base,
             stats,
         }
@@ -288,7 +249,7 @@ impl ScriptPumps {
 }
 
 /// 把原始查询错误回投脚本线程(回调边界再渲染诊断)。
-fn resolve_err(
+pub(super) fn resolve_err(
     player: &PlayerCore,
     query: QueryId,
     error: impl std::error::Error + Send + Sync + 'static,
@@ -300,7 +261,7 @@ fn resolve_err(
 }
 
 /// 把一条查询结果回投脚本线程(无脚本时静默丢——查询本就发不出来)。
-fn resolve_ok(player: &PlayerCore, query: QueryId, value: ResolveValue) {
+pub(super) fn resolve_ok(player: &PlayerCore, query: QueryId, value: ResolveValue) {
     if let Some(sender) = player.script_sender() {
         sender.resolve(query, value);
     }
@@ -339,76 +300,9 @@ fn apply_library_song_url(player: &PlayerCore, song: SongId, query: QueryId) {
     });
 }
 
-/// 跑一次 `library.search` 并回投结果。
-///
-/// 限定源:查不到对应 channel / 该源失败都回 `(nil, err)`。
-/// 不限定:跨全部源聚合,单源失败 warn 跳过(与 `library.playlists` 同语义)。
-///
-/// # Params:
-///   - `term`: 关键词
-///   - `source`: 限定源(`None` = 全源聚合)
-///   - `page`: 分页
-///   - `query`: 回投句柄
-async fn resolve_search(
-    player: &PlayerCore,
-    term: String,
-    source: Option<mineral_model::SourceKind>,
-    page: mineral_channel_core::Page,
-    query: QueryId,
-) {
-    // 埋点页码 = offset / limit(Page 是 Copy,search_songs 后仍可读)。
-    let page_no = i64::from(page.offset.checked_div(page.limit).unwrap_or(0));
-    match source {
-        Some(source) => {
-            let Some(channel) = player.channel_for(source).cloned() else {
-                let error = QueryError::MissingChannel(source);
-                resolve_err(player, query, error);
-                return;
-            };
-            match channel.search_songs(&term, page).await {
-                Ok(hits) => {
-                    record_script_search(player, &term, source, page_no, Some(hits.items.len()));
-                    resolve_ok(player, query, ResolveValue::Songs(hits.items));
-                }
-                Err(e) => {
-                    record_script_search(player, &term, source, page_no, None);
-                    resolve_err(player, query, e);
-                }
-            }
-        }
-        None => {
-            let mut songs = Vec::new();
-            for channel in player.channels() {
-                match channel.search_songs(&term, page).await {
-                    Ok(hits) => {
-                        record_script_search(
-                            player,
-                            &term,
-                            channel.source(),
-                            page_no,
-                            Some(hits.items.len()),
-                        );
-                        songs.extend(hits.items);
-                    }
-                    Err(e) => {
-                        record_script_search(player, &term, channel.source(), page_no, None);
-                        mineral_log::warn!(
-                            target: "script",
-                            source = channel.source().name(),
-                            error = mineral_log::chain(&e),
-                            "library.search: 该源搜索失败,跳过"
-                        );
-                    }
-                }
-            }
-            resolve_ok(player, query, ResolveValue::Songs(songs));
-        }
-    }
-}
-
 /// 记录 `library.search` 的歌曲搜索(actor=script)。
 /// `count` 有值表示成功,`None` 表示失败。
-fn record_script_search(
+pub(super) fn record_script_search(
     player: &PlayerCore,
     term: &str,
     source: mineral_model::SourceKind,
@@ -525,7 +419,7 @@ fn apply_cmd(player: &PlayerCore, cmd: ScriptCmd) {
             let before = player.with_state(|st| st.queue.len());
             if matches!(
                 player.queue_reorder(&ids),
-                mineral_protocol::QueueEditOutcome::Applied
+                mineral_protocol::QueueEditOutcome::Applied { .. }
             ) {
                 let after = player.with_state(|st| st.queue.len());
                 player.record_behavior(
@@ -590,8 +484,7 @@ fn apply_cmd(player: &PlayerCore, cmd: ScriptCmd) {
                     resolve_err(&player, query, error);
                     return;
                 };
-                match channel
-                    .playlist_detail(&playlist, mineral_channel_core::PlaylistLoad::Complete)
+                match finish_playlist(channel.playlist_detail(&playlist, CachePolicy::UseCache))
                     .await
                 {
                     Ok(playlist) => {
@@ -610,15 +503,16 @@ fn apply_cmd(player: &PlayerCore, cmd: ScriptCmd) {
         ScriptCmd::LibrarySearch {
             term,
             source,
-            offset,
-            limit,
-            query,
+            requests,
+            closed,
         } => {
-            let player = player.clone();
-            tokio::spawn(async move {
-                let page = mineral_channel_core::Page::new(offset, limit);
-                resolve_search(&player, term, source, page, query).await;
-            });
+            tokio::spawn(crate::script_search::run(
+                player.clone(),
+                term,
+                source,
+                requests,
+                closed,
+            ));
         }
         ScriptCmd::LibrarySongUrl { song, query } => apply_library_song_url(player, song, query),
         ScriptCmd::ConfigOverride { ops } => {

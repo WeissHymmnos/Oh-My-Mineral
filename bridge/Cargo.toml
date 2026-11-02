@@ -11,24 +11,25 @@ name = "mineral-gui-bridge"
 path = "src/main.rs"
 
 [dependencies]
-mineral-audio = "0.5.10"
-mineral-channel-bilibili = "0.5.10"
-mineral-channel-core = "0.5.10"
-mineral-channel-local = "0.5.10"
-mineral-channel-mineral = "0.5.10"
-mineral-channel-netease = "0.5.10"
-mineral-client = "0.5.10"
-mineral-config = "0.5.10"
-mineral-log = "0.5.10"
-mineral-model = "0.5.10"
-mineral-paths = "0.5.10"
-mineral-playback = "0.5.10"
-mineral-protocol = "0.5.10"
-mineral-script = "0.5.10"
-mineral-server = "0.5.10"
-mineral-stats = "0.5.10"
-mineral-task = "0.5.10"
+mineral-audio = { path = "../vendor/mineral-audio" }
+mineral-channel-apple-music = { path = "../vendor/mineral-channel-apple-music" }
+mineral-channel-bilibili = { path = "../vendor/mineral-channel-bilibili" }
+mineral-channel-core = { path = "../vendor/mineral-channel-core" }
+mineral-channel-local = { path = "../vendor/mineral-channel-local" }
+mineral-channel-mineral = { path = "../vendor/mineral-channel-mineral" }
+mineral-channel-netease = { path = "../vendor/mineral-channel-netease" }
+mineral-client = { path = "../vendor/mineral-client" }
+mineral-common = { path = "../vendor/mineral-common" }
+mineral-config = { path = "../vendor/mineral-config" }
+mineral-log = { path = "../vendor/mineral-log" }
+mineral-model = { path = "../vendor/mineral-model" }
+mineral-paths = { path = "../vendor/mineral-paths" }
+mineral-playback = { path = "../vendor/mineral-playback" }
+mineral-protocol = { path = "../vendor/mineral-protocol" }
+mineral-script = { path = "../vendor/mineral-script" }
+mineral-server = { path = "../vendor/mineral-server" }
+mineral-stats = { path = "../vendor/mineral-stats" }
+mineral-task = { path = "../vendor/mineral-task" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "process", "net", "signal", "fs"] }
-# 0.7.20 makes LengthDelimitedCodec's Encoder impl ambiguous for Mineral 0.5.10.
-tokio-util = { version = "=0.7.18", features = ["codec", "io"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }

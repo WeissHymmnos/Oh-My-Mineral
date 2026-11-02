@@ -1,0 +1,15 @@
+[package]
+name = "mineral-persist"
+description = "SQLite 连接与通用文件缓存机制"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-common = { path = "../mineral-common", version = "0.6.0" }
+thiserror = "1"
+sea-orm = { version = "2.0.2", default-features = false, features = ["macros", "sqlx-sqlite", "runtime-tokio", "sqlite-use-returning-for-3_35", "with-chrono"] }
+tokio = { version = "1.45.1", features = ["full"] }
+rustc-hash = "2"
+parking_lot = "0.12"
+mineral-log = { path = "../mineral-log", version = "0.6.0" }

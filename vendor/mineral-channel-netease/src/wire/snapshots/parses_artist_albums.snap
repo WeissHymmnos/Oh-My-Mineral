@@ -1,0 +1,46 @@
+---
+source: crates/mineral-channel/netease/src/wire/artist.rs
+assertion_line: 135
+description: artist 的 album 列表(乐与怒 带 size/company/artists / 继续革命 缺字段)解析结构
+expression: r
+---
+ArtistAlbumsResult {
+    hot_albums: [
+        ArtistAlbum {
+            id: 9,
+            name: "乐与怒",
+            pic_url: Some(
+                "https://p1.music.126.net/a.jpg",
+            ),
+            publish_time: Some(
+                736185600000,
+            ),
+            size: 10,
+            company: Some(
+                "滚石",
+            ),
+            artist: None,
+            artists: [
+                Artist {
+                    id: 11127,
+                    name: "Beyond",
+                },
+            ],
+        },
+        ArtistAlbum {
+            id: 8,
+            name: "继续革命",
+            pic_url: None,
+            publish_time: Some(
+                715000000000,
+            ),
+            size: 0,
+            company: None,
+            artist: None,
+            artists: [],
+        },
+    ],
+    more: Some(
+        false,
+    ),
+}

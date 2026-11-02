@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use mineral_common::revision::Revision;
 use mineral_model::{BitRate, SongId};
 use mineral_protocol::{
     DownloadFailure, DownloadId, DownloadStatus, DownloadSummary, DownloadWave, SongDownloadView,
@@ -12,6 +14,14 @@ use tokio_util::sync::CancellationToken;
 
 /// Maximum terminal rows retained for the current daemon session.
 const TERMINAL_LIMIT: usize = 100;
+
+/// Coalesced read-only state published by the manager task.
+#[derive(Clone)]
+pub(crate) struct DownloadSnapshot {
+    pub(crate) summary: DownloadSummary,
+
+    pub(crate) rows: Arc<Vec<SongDownloadView>>,
+}
 
 /// Mutable manager-owned state.
 pub(super) struct ManagerState {
@@ -34,7 +44,7 @@ pub(super) struct ManagerState {
     pub(super) terminal: VecDeque<DownloadId>,
 
     /// Monotonic admission order.
-    pub(super) next_admission: u64,
+    pub(super) next_admission: Revision,
 
     /// Download quality applied to new admissions.
     pub(super) quality: BitRate,
@@ -64,7 +74,7 @@ pub(super) struct SongDownload {
     pub(super) key: DownloadKey,
 
     /// Monotonic admission order.
-    pub(super) admission_order: u64,
+    pub(super) admission_order: Revision,
 }
 
 /// Duplicate identity for one export request.
@@ -90,7 +100,7 @@ impl ManagerState {
             active: FxHashMap::default(),
             dedup: FxHashMap::default(),
             terminal: VecDeque::new(),
-            next_admission: 0,
+            next_admission: Revision::default(),
             quality,
             max_concurrent,
             preparing_playlists: 0,
@@ -101,7 +111,7 @@ impl ManagerState {
     }
 
     /// Returns the small per-tick summary.
-    pub(super) fn summary(&self) -> DownloadSummary {
+    fn summary(&self) -> DownloadSummary {
         let queued = self
             .rows
             .values()
@@ -122,7 +132,7 @@ impl ManagerState {
     }
 
     /// Returns active, queued, then newest-first terminal rows.
-    pub(super) fn snapshot(&self) -> Vec<SongDownloadView> {
+    pub(super) fn snapshot(&self) -> DownloadSnapshot {
         let mut rows = self
             .rows
             .values()
@@ -134,7 +144,8 @@ impl ManagerState {
                 row.admission_order,
             )
         });
-        rows.into_iter()
+        let rows = rows
+            .into_iter()
             .chain(
                 self.terminal
                     .iter()
@@ -142,7 +153,11 @@ impl ManagerState {
                     .filter_map(|id| self.rows.get(id)),
             )
             .map(|row| row.view.clone())
-            .collect()
+            .collect();
+        DownloadSnapshot {
+            summary: self.summary(),
+            rows: Arc::new(rows),
+        }
     }
 
     /// Starts a result wave when the manager was previously settled.
@@ -210,8 +225,10 @@ impl ManagerState {
         if !self.wave_open || queued || !self.active.is_empty() || self.preparing_playlists > 0 {
             return;
         }
-        let previous = self.latest_wave.as_ref().map_or(0, |wave| wave.sequence);
-        self.wave.sequence = previous.wrapping_add(1);
+        self.wave.sequence = self
+            .latest_wave
+            .as_ref()
+            .map_or_else(Revision::default, |wave| wave.sequence.next());
         self.latest_wave = Some(self.wave.clone());
         self.wave_open = false;
     }

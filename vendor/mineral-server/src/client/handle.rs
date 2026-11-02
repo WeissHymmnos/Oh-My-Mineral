@@ -1,14 +1,17 @@
 //! [`ClientHandle`]:daemon 内部业务调用面。
 
 use mineral_channel_core::ChannelCaps;
-use mineral_model::{Song, SongId, SourceKind};
+use mineral_common::revision::Revision;
+use mineral_model::{RefreshScope, SearchKind, Song, SongId, SourceKind};
 use mineral_protocol::{
     DownloadId, DownloadTarget, Event, PlayMode, PlayQueueError, PlayerSync, PlayerVersions,
     QueueContextWire, QueueEditOutcome, QueueOp, SongStatsWire,
 };
-use mineral_task::{Priority, TaskEvent, TaskKind};
+use mineral_task::{Priority, Scheduler, SearchPayload, TaskEvent, TaskKind};
+use tokio::sync::watch;
 
 use super::wire::{edited_song_id, queue_context_from_wire, stats_queue_op};
+use crate::download::StopError;
 use crate::player::PlayerCore;
 
 /// 同进程 client handle:持 `PlayerCore` 的 Arc 句柄,所有调用直接 forward。
@@ -55,7 +58,7 @@ impl ClientHandle {
     /// 派生某条 wire 连接专属的 handle(serve 层 accept 时调)。
     ///
     /// # Params:
-    ///   - `conn`: 连接 id(注册表分配,进程内唯一)
+    ///   - `conn`: 连接 ID，由接入任务分配、进程内唯一
     pub(crate) fn for_connection(&self, conn: u64) -> Self {
         let mut handle = self.clone();
         handle.conn = conn;
@@ -158,7 +161,7 @@ impl ClientHandle {
                         .notify()
                         .failure(mineral_protocol::FailureNotice::QueueTransformInvalidSong);
                 }
-                if matches!(outcome, QueueEditOutcome::Applied) {
+                if matches!(outcome, QueueEditOutcome::Applied { .. }) {
                     self.record_behavior(mineral_stats::BehaviorEvent::QueueOp {
                         op: mineral_stats::QueueOp::Transform,
                         song: None,
@@ -442,7 +445,7 @@ impl ClientHandle {
     pub(crate) fn queue_edit(&self, op: &QueueOp) -> QueueEditOutcome {
         let before = self.player.with_state(|st| st.queue.len());
         let outcome = self.player.queue_edit(op);
-        if matches!(outcome, QueueEditOutcome::Applied) {
+        if matches!(outcome, QueueEditOutcome::Applied { .. }) {
             let after = self.player.with_state(|st| st.queue.len());
             self.record_behavior(mineral_stats::BehaviorEvent::QueueOp {
                 op: stats_queue_op(op),
@@ -493,7 +496,7 @@ impl ClientHandle {
     }
 
     /// 播放状态变更订阅端。
-    pub(crate) fn state_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub(crate) fn state_changes(&self) -> watch::Receiver<Revision> {
         self.player.state_changes()
     }
 
@@ -506,6 +509,27 @@ impl ClientHandle {
         self.player.submit_task(kind, priority);
     }
 
+    /// Source execution queues shared by finite tasks and subscription streams.
+    pub(crate) fn scheduler(&self) -> Scheduler {
+        self.player.inner.scheduler.clone()
+    }
+
+    pub(crate) fn record_search_result(
+        &self,
+        source: SourceKind,
+        kind: SearchKind,
+        query: &str,
+        batch: u64,
+        payload: &SearchPayload,
+    ) {
+        self.player
+            .record_search_result(source, kind, query, batch, payload);
+    }
+
+    pub(crate) fn refresh_collections(&self, scope: &RefreshScope) {
+        self.player.refresh_collections(scope);
+    }
+
     /// 提交单曲 / 歌单下载。
     ///
     /// # Params:
@@ -514,12 +538,12 @@ impl ClientHandle {
         self.player.download(target)
     }
 
-    /// Stop 一个下载。
+    /// 等待下载管理任务受理 Stop；活动 writer 随后协作退出。
     ///
     /// # Params:
     ///   - `id`: 下载 id
-    pub(crate) fn stop_download(&self, id: &DownloadId) -> Result<(), crate::download::StopError> {
-        self.player.stop_download(id)
+    pub(crate) async fn stop_download(&self, id: &DownloadId) -> Result<(), StopError> {
+        self.player.stop_download(id).await
     }
 
     /// 上报终端 UI 状态。

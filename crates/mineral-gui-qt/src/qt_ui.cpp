@@ -1408,13 +1408,17 @@ QString find_mineral_binary() {
     const QString exe_name = QStringLiteral("mineral");
     const QString bridge_name = QStringLiteral("mineral-gui-bridge");
 #endif
-    const QString beside_app = QDir(QCoreApplication::applicationDirPath()).filePath(exe_name);
-    if (QFileInfo::exists(beside_app)) {
-        return beside_app;
-    }
     const QString bridge_beside = QDir(QCoreApplication::applicationDirPath()).filePath(bridge_name);
     if (QFileInfo::exists(bridge_beside)) {
         return bridge_beside;
+    }
+    const QString bridge_in_path = QStandardPaths::findExecutable(QStringLiteral("mineral-gui-bridge"));
+    if (!bridge_in_path.isEmpty()) {
+        return bridge_in_path;
+    }
+    const QString beside_app = QDir(QCoreApplication::applicationDirPath()).filePath(exe_name);
+    if (QFileInfo::exists(beside_app)) {
+        return beside_app;
     }
     const QString in_path = QStandardPaths::findExecutable(QStringLiteral("mineral"));
     if (!in_path.isEmpty()) {
@@ -1625,6 +1629,144 @@ void open_qr_login_dialog(const QString& channel_id) {
     delete qr_rendered;
     dlg->deleteLater();
 }
+void open_am_token_dialog() {
+    auto* dlg = new QDialog(window);
+    dlg->setWindowTitle(QStringLiteral("Apple Music — Token Login"));
+    dlg->setModal(true);
+    dlg->setStyleSheet(shell_style(touch_on));
+    dlg->resize(520, 260);
+
+    auto* v = new QVBoxLayout(dlg);
+    v->setContentsMargins(24, 20, 24, 20);
+    v->setSpacing(12);
+
+    auto* title_lbl = new QLabel(QStringLiteral("Apple Music Token Login"));
+    title_lbl->setObjectName("heading");
+    title_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(title_lbl);
+
+    auto* sub_lbl = new QLabel(QStringLiteral("Sign in at music.apple.com, copy the media-user-token cookie value from browser DevTools, and paste it below:"));
+    sub_lbl->setObjectName("muted");
+    sub_lbl->setWordWrap(true);
+    sub_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(sub_lbl);
+
+    auto* token_edit = new QLineEdit();
+    token_edit->setPlaceholderText(QStringLiteral("Paste media-user-token cookie here…"));
+    token_edit->setEchoMode(QLineEdit::PasswordEchoOnEdit);
+    token_edit->setClearButtonEnabled(true);
+    token_edit->setMinimumHeight(36);
+    v->addWidget(token_edit);
+
+    auto* status_lbl = new QLabel();
+    status_lbl->setObjectName("muted");
+    status_lbl->setWordWrap(true);
+    status_lbl->setAlignment(Qt::AlignCenter);
+    v->addWidget(status_lbl);
+
+    v->addStretch(1);
+
+    auto* btn_row = new QHBoxLayout();
+    auto* cancel_btn = new QPushButton(QStringLiteral("Cancel"));
+    cancel_btn->setObjectName("ghost");
+    cancel_btn->setCursor(Qt::PointingHandCursor);
+    auto* login_btn = new QPushButton(QStringLiteral("Sign In"));
+    login_btn->setObjectName("chip");
+    login_btn->setCursor(Qt::PointingHandCursor);
+    btn_row->addStretch(1);
+    btn_row->addWidget(cancel_btn);
+    btn_row->addWidget(login_btn);
+    btn_row->addStretch(1);
+    v->addLayout(btn_row);
+
+    auto* proc = new QProcess(dlg);
+    auto* err_buf = new QString();
+    auto* out_buf = new QString();
+    auto* pending_token = new QString();
+
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, dlg, [proc, out_buf]() {
+        *out_buf += QString::fromUtf8(proc->readAllStandardOutput());
+    });
+
+    QObject::connect(proc, &QProcess::readyReadStandardError, dlg, [proc, err_buf]() {
+        *err_buf += QString::fromUtf8(proc->readAllStandardError());
+    });
+
+    QObject::connect(proc, &QProcess::started, dlg, [proc, pending_token]() {
+        proc->write(pending_token->toUtf8() + "\n");
+        proc->closeWriteChannel();
+    });
+
+    QObject::connect(proc, &QProcess::errorOccurred, dlg, [token_edit, login_btn, status_lbl](QProcess::ProcessError err) {
+        token_edit->setEnabled(true);
+        login_btn->setEnabled(true);
+        if (err == QProcess::FailedToStart) {
+            status_lbl->setText(QStringLiteral("Failed to start mineral CLI process."));
+        }
+    });
+
+    auto start_token_login = [proc, token_edit, status_lbl, login_btn, err_buf, out_buf, pending_token]() {
+        QString raw_token = token_edit->text().trimmed();
+        if (raw_token.startsWith(QStringLiteral("media-user-token="), Qt::CaseInsensitive)) {
+            raw_token = raw_token.mid(17).trimmed();
+        }
+        if (raw_token.endsWith(';')) {
+            raw_token.chop(1);
+            raw_token = raw_token.trimmed();
+        }
+        if (raw_token.isEmpty()) {
+            status_lbl->setText(QStringLiteral("Token cannot be empty. Please enter your media-user-token."));
+            return;
+        }
+        if (proc->state() != QProcess::NotRunning) {
+            proc->kill();
+            proc->waitForFinished(300);
+        }
+        err_buf->clear();
+        out_buf->clear();
+        *pending_token = raw_token;
+        token_edit->setEnabled(false);
+        login_btn->setEnabled(false);
+        status_lbl->setText(QStringLiteral("Validating Apple Music account, please wait…"));
+
+        proc->start(find_mineral_binary(), {QStringLiteral("channel"), QStringLiteral("am"), QStringLiteral("login")});
+    };
+
+    QObject::connect(proc,
+                     QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     dlg,
+                     [dlg, status_lbl, token_edit, login_btn, err_buf, out_buf](int exit_code, QProcess::ExitStatus status) {
+                         token_edit->setEnabled(true);
+                         login_btn->setEnabled(true);
+                         if (status == QProcess::NormalExit && exit_code == 0) {
+                             status_lbl->setText(QStringLiteral("Apple Music login successful! Reloading daemon to sync your account…"));
+                             push_action("{\"action\":\"restart_daemon\"}");
+                             QTimer::singleShot(900, dlg, &QDialog::accept);
+                         } else {
+                             QString msg = err_buf->trimmed();
+                             if (msg.isEmpty()) msg = out_buf->trimmed();
+                             if (msg.isEmpty()) {
+                                 msg = QStringLiteral("Login failed (exit code %1).").arg(exit_code);
+                             }
+                             status_lbl->setText(msg);
+                         }
+                     });
+
+    QObject::connect(login_btn, &QPushButton::clicked, dlg, start_token_login);
+    QObject::connect(token_edit, &QLineEdit::returnPressed, dlg, start_token_login);
+    QObject::connect(cancel_btn, &QPushButton::clicked, dlg, &QDialog::reject);
+
+    dlg->exec();
+    if (proc->state() != QProcess::NotRunning) {
+        proc->kill();
+        proc->waitForFinished(300);
+    }
+    delete err_buf;
+    delete out_buf;
+    delete pending_token;
+    dlg->deleteLater();
+}
+
 }  // namespace
 
 extern "C" void qt_init() {
@@ -1886,6 +2028,7 @@ extern "C" void qt_init() {
     });
     menu->addAction("Toggle Fullscreen Player (Z)", [] { push_action("{\"action\":\"toggle_immersive\"}"); });
     menu->addSeparator();
+    menu->addAction("Login: Apple Music (Token)…", [] { open_am_token_dialog(); });
     menu->addAction("Login: NetEase Cloud Music (QR Code)…", [] { open_qr_login_dialog(QStringLiteral("netease")); });
     menu->addAction("Login: Bilibili (QR Code)…", [] { open_qr_login_dialog(QStringLiteral("bilibili")); });
     menu->addSeparator();
@@ -2470,7 +2613,8 @@ extern "C" void qt_init() {
     for (auto [sid, slabel] : std::initializer_list<std::pair<const char*, const char*>>{
              {"", "All Sources"},
              {"netease", "NetEase"},
-             {"bilibili", "Bilibili"}}) {
+             {"bilibili", "Bilibili"},
+             {"am", "Apple Music"}}) {
         auto* btn = new QPushButton(slabel);
         btn->setObjectName("chip");
         btn->setCursor(Qt::PointingHandCursor);
@@ -2993,8 +3137,14 @@ extern "C" void qt_init() {
         if (key == "settings:daemon:restart") { push_action("{\"action\":\"restart_daemon\"}"); return true; }
         if (key == "settings:daemon:audio_output") { push_action("{\"action\":\"cycle_audio_output\"}"); return true; }
         if (key == "settings:daemon:reset_defaults") { push_action("{\"action\":\"daemon_config_reset\"}"); return true; }
+        if (key == "settings:login:am") { open_am_token_dialog(); return true; }
         if (key == "settings:login:netease") { open_qr_login_dialog(QStringLiteral("netease")); return true; }
         if (key == "settings:login:bilibili") { open_qr_login_dialog(QStringLiteral("bilibili")); return true; }
+        if (key == "source:am"
+            && item->data(mineral_ui::RoleSubtitle).toString().contains(QStringLiteral("Not logged in"), Qt::CaseInsensitive)) {
+            open_am_token_dialog();
+            return true;
+        }
         if ((key == "source:netease" || key == "source:bilibili")
             && item->data(mineral_ui::RoleSubtitle).toString().contains(QStringLiteral("Not logged in"), Qt::CaseInsensitive)) {
             open_qr_login_dialog(key.mid(7));
@@ -3109,7 +3259,10 @@ extern "C" void qt_init() {
             return;
         }
         if (kind == "playlist" || kind == "album" || kind == "artist" || kind == "source") {
-            if (raw_key == "source:netease" || raw_key == "source:bilibili") {
+            if (raw_key == "source:am") {
+                ctx.addAction("Token Login / Switch Account…", [] { open_am_token_dialog(); });
+                ctx.addSeparator();
+            } else if (raw_key == "source:netease" || raw_key == "source:bilibili") {
                 const QString ch = raw_key.mid(7);
                 ctx.addAction("QR Code Login / Switch Account…", [ch] { open_qr_login_dialog(ch); });
                 ctx.addSeparator();
@@ -3509,6 +3662,7 @@ extern "C" void qt_set_snapshot(const char* json) {
                 QString slabel = sid;
                 if (sid == "netease") slabel = "NetEase";
                 else if (sid == "bilibili") slabel = "Bilibili";
+                else if (sid == "am") slabel = "Apple Music";
                 else slabel = sid.left(1).toUpper() + sid.mid(1);
                 auto* btn = new QPushButton(slabel);
                 btn->setObjectName("chip");

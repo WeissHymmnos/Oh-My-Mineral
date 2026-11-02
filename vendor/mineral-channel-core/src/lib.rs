@@ -1,0 +1,238 @@
+//! 音乐源接入的 channel(连接器)trait。
+//!
+//! 任何具体音乐源(网易云、本地、QQ ……)都通过实现 [`MusicChannel`] 接入。
+//! 上层只面向 trait 编程,channel 实现间通过 [`mineral_model`] 中的统一类型互通。
+
+mod batch;
+mod caps;
+mod collection;
+mod error;
+mod fetch;
+mod page;
+mod playlist;
+
+pub mod store;
+
+pub use batch::{Batch, BatchStream, page_batches};
+pub use caps::{ArtistSectionKind, ArtistSections, ChannelCaps};
+pub use collection::{CollectionStream, albums_with_cache, fresh_collection, playlists_with_cache};
+pub use error::{BoxError, Error, Result};
+pub use fetch::{FetchSnapshot, FetchStream, finish_fetch, fresh_snapshot};
+pub use page::{Page, PageResult};
+pub use playlist::{PlaylistDetail, finish_playlist};
+
+use async_trait::async_trait;
+use mineral_model::{
+    Album, AlbumId, Artist, ArtistId, CachePolicy, Lyrics, Playlist, PlaylistId, Song, SongId,
+    SourceKind, UserId,
+};
+use rustc_hash::FxHashSet;
+
+/// 接入一个音乐源的 channel(连接器)统一接口。
+///
+/// 所有方法都是异步、可独立失败的;不支持的能力直接返回 [`Error::NotSupported`]。
+#[async_trait]
+pub trait MusicChannel: Send + Sync {
+    /// 该 channel 服务的来源(`source`)标识。
+    fn source(&self) -> SourceKind;
+
+    /// 该 channel 的能力声明,见 [`ChannelCaps`]。
+    ///
+    /// 刻意**不给默认实现**:能力是每个 channel 必须显式表态的事,
+    /// 默认值会让新 channel 静默继承错误声明。
+    fn caps(&self) -> ChannelCaps;
+
+    // ---------- 搜索 ----------
+    // 来源拥有分页进度，调用者每次消费只请求一批；完整性由来源判断。
+    // 错误保留当前位置，再次消费才重试；丢弃流结束本次搜索。
+
+    /// 搜索单曲(可选)。
+    fn search_songs<'a>(&'a self, _query: &'a str) -> BatchStream<'a, Song> {
+        page_batches(|_page| async { Err(Error::NotSupported) })
+    }
+    /// 搜索专辑(可选)。
+    fn search_albums<'a>(&'a self, _query: &'a str) -> BatchStream<'a, Album> {
+        page_batches(|_page| async { Err(Error::NotSupported) })
+    }
+    /// 搜索歌单(可选)。
+    fn search_playlists<'a>(&'a self, _query: &'a str) -> BatchStream<'a, Playlist> {
+        page_batches(|_page| async { Err(Error::NotSupported) })
+    }
+    /// 搜索艺人(可选)。
+    fn search_artists<'a>(&'a self, _query: &'a str) -> BatchStream<'a, Artist> {
+        page_batches(|_page| async { Err(Error::NotSupported) })
+    }
+
+    // ---------- 详情 ----------
+    /// 拉取若干歌曲的详情。
+    async fn songs_detail(&self, ids: &[SongId], cache: CachePolicy) -> Result<Vec<Song>>;
+
+    /// 拉取一张专辑的完整详情:元信息(简介 / 发行信息 / 曲目数等)+ 曲目 relation(`tracks`)。
+    ///
+    /// 返回**完整实体**而非裸曲目:上层要的是"这张专辑的完整视图",至于 channel 内部打几个
+    /// 端点拼出来是实现细节。只要曲目的调用方从 `.tracks` 投影 `.song` 即可。
+    /// 未过期缓存直接产出 Fresh；过期缓存可先产出 Cached，再刷新。Reload 只产出 Fresh。
+    fn album_detail<'a>(&'a self, _id: &'a AlbumId, _cache: CachePolicy) -> FetchStream<'a, Album> {
+        fresh_snapshot(async { Err(Error::NotSupported) })
+    }
+
+    /// 按需读取歌单，每份快照包含已检查前缀的全部曲目，保留来源顺序和重复项。
+    ///
+    /// Cached 仅供展示，Fresh 确认当前前缀。最后一份 Fresh 必须标记 complete；
+    /// 中途失败返回错误。继续消费才请求下一批，丢弃流取消后续读取。
+    /// Reload 禁止读取旧缓存或失败后回退。
+    fn playlist_detail<'a>(
+        &'a self,
+        _id: &'a PlaylistId,
+        _cache: CachePolicy,
+    ) -> FetchStream<'a, PlaylistDetail> {
+        fresh_snapshot(async { Err(Error::NotSupported) })
+    }
+    /// 拉取艺人详情(可选)。
+    async fn artist_detail(&self, _id: &ArtistId) -> Result<Artist> {
+        Err(Error::NotSupported)
+    }
+
+    /// 按需读取艺人专辑；来源持有分页进度，失败后再次消费重试当前批次。
+    /// `tracks` 留空，曲目按需走 [`Self::album_detail`]。
+    fn artist_albums<'a>(&'a self, _id: &'a ArtistId) -> BatchStream<'a, Album> {
+        page_batches(|_page| async { Err(Error::NotSupported) })
+    }
+
+    // ---------- 歌单管理(可选写操作) ----------
+    // 前置条件(调用方保证,server 在边界校验):涉及的 SongId 必须与歌单
+    // PlaylistId 同 namespace——远程歌单装不下别源的歌,channel 实现不做
+    // 防御性检查。写操作失败语义见 [`Error`];实现方不得把远端的"已存在"
+    // 等业务态伪装成成功。
+
+    /// 创建歌单(可选)。
+    ///
+    /// # Params:
+    ///   - `name`: 歌单名
+    ///
+    /// # Return:
+    ///   新建的歌单。实现方应从创建响应直接映射,避免"建完再拉列表"的额外往返。
+    async fn create_playlist(&self, _name: &str) -> Result<Playlist> {
+        Err(Error::NotSupported)
+    }
+
+    /// 删除自己创建的歌单(可选)。
+    async fn delete_playlist(&self, _id: &PlaylistId) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 向歌单追加歌曲(可选)。
+    ///
+    /// 歌曲已在歌单中时透传远端语义(如网易云 code 502 的
+    /// [`Error::Api`]),由上层翻译,不伪装成功。
+    ///
+    /// # Params:
+    ///   - `id`: 目标歌单
+    ///   - `songs`: 待追加歌曲(与歌单同 namespace)
+    async fn playlist_add_songs(&self, _id: &PlaylistId, _songs: &[SongId]) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 从歌单移除歌曲(可选)。
+    ///
+    /// # Params:
+    ///   - `id`: 目标歌单
+    ///   - `songs`: 待移除歌曲(与歌单同 namespace)
+    async fn playlist_remove_songs(&self, _id: &PlaylistId, _songs: &[SongId]) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 歌单改名(可选)。
+    async fn rename_playlist(&self, _id: &PlaylistId, _name: &str) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 修改歌单描述(可选)。
+    async fn set_playlist_description(&self, _id: &PlaylistId, _desc: &str) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 拉取一首歌的歌词(可选)。
+    async fn lyrics(&self, _id: &SongId) -> Result<Lyrics> {
+        Err(Error::NotSupported)
+    }
+
+    // ---------- 用户歌单(可选) ----------
+    /// 拉取指定 uid 用户的歌单列表(可选)。
+    ///
+    /// 用于"看其他人的歌单"等需要显式 uid 的场景;TUI 默认走 [`Self::my_playlists`]。
+    async fn user_playlists(&self, _uid: &UserId) -> Result<Vec<Playlist>> {
+        Err(Error::NotSupported)
+    }
+
+    /// 拉取**该 channel 实例自身上下文中**的"我的歌单"。
+    ///
+    /// 这是跨 channel 聚合当前用户歌单的入口。实例已绑定用户身份时可转发给
+    /// [`Self::user_playlists`];没有当前用户歌单能力或未登录时返回 [`Error::NotSupported`]。
+    ///
+    /// `UseCache` 可先产出缓存，再刷新并产出新列表；`Reload` 只产出新列表。
+    /// 消费到流结束才完成请求；丢弃流会取消后续读取。错误后流结束。
+    fn my_playlists(&self, _cache: CachePolicy) -> CollectionStream<'_, Playlist> {
+        fresh_collection(async { Err(Error::NotSupported) })
+    }
+
+    /// 拉取该 channel 当前账号收藏的全部专辑，保留来源返回的顺序。
+    /// 缓存、刷新与取消语义同 [`Self::my_playlists`]。
+    fn my_albums(&self, _cache: CachePolicy) -> CollectionStream<'_, Album> {
+        fresh_collection(async { Err(Error::NotSupported) })
+    }
+
+    // ---------- 用户数据 / 装饰(可选) ----------
+    // 这一组方法都是「同一登录用户视角下,跨歌曲的元信息」,bulk 一次拉满,
+    // 上层用来 decorate Song 或 collection entry view。沿用 default `NotSupported` 模式。
+
+    /// 拉该源**远端**记录的喜欢(♥)歌曲 ID 集合(纯远端、read-only)。
+    ///
+    /// 返回 `FxHashSet` 而非 `Vec` 是因为调用方会做点查("这首歌 like 了吗")。语义是**纯远端**:
+    /// 本地收藏集不在此参与——上层把它导入本地事实来源后与本地合并。不支持 / 未登录时返回
+    /// [`Error::NotSupported`]。
+    async fn liked_song_ids(&self) -> Result<FxHashSet<SongId>> {
+        Err(Error::NotSupported)
+    }
+
+    /// 把一首歌的喜欢(♥)状态镜像到该源的**远端**收藏机制(纯远端镜像)。
+    ///
+    /// 本地持久化由上层统一负责,不在此写;此方法只把状态同步到远端。无远端能力 / 未登录时返回
+    /// [`Error::NotSupported`]（上层视为该源无远端镜像,不影响本地已写）。
+    ///
+    /// # Params:
+    ///   - `id`: 目标歌曲
+    ///   - `loved`: `true` 喜欢、`false` 取消
+    async fn set_loved(&self, _id: &SongId, _loved: bool) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// 拉取该 channel 远端记录的「当前用户对这首歌的真实累计播放次数」。
+    ///
+    /// 语义上**与本地 persist 统计无关**:这是音乐源服务端的事实(如网易云
+    /// 网页 + App + 本客户端的全渠道累计),而非本地这台机器上播了几次。
+    /// 默认 [`Error::NotSupported`](而非 `Ok(0)`),让上层能区分「该源无此能力 /
+    /// 未登录」(不显示)与「确实播了 0 次」(显示 0)。
+    ///
+    /// # Params:
+    ///   - `id`: 目标歌曲
+    ///
+    /// # Return:
+    ///   远端累计播放次数;不支持 / 未登录返回 [`Error::NotSupported`]。
+    async fn remote_play_count(&self, _id: &SongId) -> Result<u32> {
+        Err(Error::NotSupported)
+    }
+
+    /// 通知 channel 一首歌已经结束播放，不阻塞播放链路。
+    ///
+    /// daemon 的 stats recorder 独立记录本地播放事实；channel 只处理来源服务特有的上报，
+    /// 例如远端听歌打卡。默认 no-op，不支持的 channel 静默忽略。
+    ///
+    /// # Params:
+    ///   - `id`: 歌曲
+    ///   - `completed`: 是否完整播完(`false` = 被跳过)
+    ///   - `listen_ms`: 本次收听毫秒
+    async fn on_played(&self, _id: &SongId, _completed: bool, _listen_ms: u64) -> Result<()> {
+        Ok(())
+    }
+}

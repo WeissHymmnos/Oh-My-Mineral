@@ -14,10 +14,10 @@ cd "$ROOT"
 echo "==> Building Mineral GUI workspace (--release) for macOS..."
 cargo build -p mineral-gui-qt -p mineral-gui-bridge --release
 
-MINERAL_BIN="${MINERAL_BIN:-$(command -v mineral || echo "$HOME/.cargo/bin/mineral")}"
+MINERAL_BIN="${MINERAL_BIN:-$ROOT/target/release/mineral-gui-bridge}"
 if [[ ! -f "$MINERAL_BIN" ]]; then
-  echo "Installing mineral 0.5.10 daemon via cargo..."
-  cargo install mineral --version 0.5.10
+  echo "Installing mineral 0.6.0 daemon via cargo..."
+  cargo install mineral --version 0.6.0
   MINERAL_BIN="$HOME/.cargo/bin/mineral"
 fi
 

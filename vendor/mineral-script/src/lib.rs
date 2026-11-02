@@ -6,6 +6,7 @@
 //! [`TuiRuntime`] 保留复制模板闭包,不创建脚本线程。配置类型由宿主持有。
 
 mod api;
+pub mod color;
 mod copy;
 mod dispatch;
 mod hooks;
@@ -99,11 +100,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub use mlua;
 
+pub use color::{
+    AnsiSlot, ColorMix, ColorSource, ColorValue, HexColor, TerminalColor, install_color_api,
+};
 pub use copy::CopyTemplateCtx;
 pub use hooks::{
     BeforeDownloadCtx, BeforeStreamCtx, HookDecision, HookKind, HookMode, RewriteSpec,
 };
-pub use host::{ScriptHost, SourceWebUrls, install_daemon_api, seed_web_url_templates};
+pub use host::{ScriptHost, install_daemon_api};
 pub use lua_stub::TYPES_META;
 pub use message::{
     ConfigOverrideOp, CurateOutcome, CuratedEntry, PlaylistBrief, QueryId, ResolveValue, ScriptCmd,

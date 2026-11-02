@@ -43,16 +43,16 @@ pub use mineral_model::StoreValue;
 pub use mineral_task::ChannelFetchKindTag;
 pub use player::{
     AdvanceKind, CurrentSync, PlayCursor, PlayMode, PlaybackOrigin, PlayerSync, PlayerVersions,
-    QueueSync, Repeat, SegmentVersion,
+    QueueSync, Repeat,
 };
 pub use playlist::PlaylistOp;
 pub use queue_edit::{QueueAnchor, QueueEditOutcome, QueueOp, QueuePos};
 pub use service::{PlayCountAvailability, ServiceInfo};
 pub use session::{
-    CloseReason, DOWNLOAD_DETAIL_PART_ROWS, DownloadDetailDelta, DownloadDetailUpdate, FailureKind,
-    MessageBatch, OperationFailure, OperationResult, PLAYER_QUEUE_PART_ROWS, PcmChunk, RequestId,
-    SessionMessage, SessionRequest, SessionResult, SubscribeRequest, SubscriptionId,
-    SubscriptionTopic, UpdateEnvelope, UpdatePayload, assembly_limits, fragment_download_detail,
-    fragment_player_update,
+    AdvanceSubscription, CloseReason, DOWNLOAD_DETAIL_PART_ROWS, DownloadDetailDelta,
+    DownloadDetailUpdate, FailureKind, MessageBatch, OperationFailure, OperationResult,
+    PLAYER_QUEUE_PART_ROWS, PcmChunk, RequestId, SessionMessage, SessionRequest, SessionResult,
+    SubscribeRequest, SubscriptionDemand, SubscriptionId, SubscriptionTopic, UpdateEnvelope,
+    UpdatePayload, assembly_limits, fragment_download_detail, fragment_player_update,
 };
 pub use wire::{SocketWire, Wire, WireError, WireSink, WireSource};

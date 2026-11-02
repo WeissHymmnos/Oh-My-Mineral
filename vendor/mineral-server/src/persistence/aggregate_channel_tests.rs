@@ -1,8 +1,10 @@
 //! Verifies the built-in channel through the daemon’s real library store.
 
 use crate::persistence::ServerStore;
+use color_eyre::eyre::eyre;
+use futures_util::TryStreamExt;
 use mineral_channel_core::{Error, MusicChannel};
-use mineral_model::{SongId, SourceKind};
+use mineral_model::{CachePolicy, SongId, SourceKind};
 use mineral_test::{song, with_name};
 
 use mineral_channel_mineral::{MineralChannel, favorites_playlist_id};
@@ -34,7 +36,12 @@ async fn store_with_favorites() -> color_eyre::Result<(tempfile::TempDir, Server
 async fn my_playlists_is_single_synthetic() -> color_eyre::Result<()> {
     let (_dir, store) = store_with_favorites().await?;
     let ch = MineralChannel::new(Arc::new(store));
-    let lists = ch.my_playlists().await?;
+    let lists = ch
+        .my_playlists(CachePolicy::UseCache)
+        .try_next()
+        .await?
+        .ok_or_else(|| eyre!("expected Favorites list snapshot"))?
+        .into_value();
     assert_eq!(lists.len(), 1);
     let p = lists
         .first()
@@ -53,11 +60,11 @@ async fn playlist_detail_aggregates_and_rejects_unknown() -> color_eyre::Result<
     let (_dir, store) = store_with_favorites().await?;
     let ch = MineralChannel::new(Arc::new(store));
     let p = ch
-        .playlist_detail(
-            &favorites_playlist_id(),
-            mineral_channel_core::PlaylistLoad::Complete,
-        )
+        .playlist_detail(&favorites_playlist_id(), CachePolicy::UseCache)
+        .try_next()
         .await?
+        .ok_or_else(|| eyre!("expected Favorites detail snapshot"))?
+        .into_value()
         .playlist;
     assert_eq!(p.track_count, 2);
     assert_eq!(p.entries.len(), 2, "detail 带全曲目,与 track_count 同口径");
@@ -89,7 +96,8 @@ async fn playlist_detail_aggregates_and_rejects_unknown() -> color_eyre::Result<
     let other = mineral_model::PlaylistId::new(SourceKind::MINERAL, "nope");
     assert!(
         matches!(
-            ch.playlist_detail(&other, mineral_channel_core::PlaylistLoad::Complete)
+            ch.playlist_detail(&other, CachePolicy::UseCache)
+                .try_next()
                 .await,
             Err(Error::NotFound)
         ),
@@ -103,11 +111,11 @@ async fn playlist_detail_aggregates_and_rejects_unknown() -> color_eyre::Result<
 async fn disabled_store_yields_empty_favorites() -> color_eyre::Result<()> {
     let ch = MineralChannel::new(Arc::new(ServerStore::disabled()));
     let p = ch
-        .playlist_detail(
-            &favorites_playlist_id(),
-            mineral_channel_core::PlaylistLoad::Complete,
-        )
+        .playlist_detail(&favorites_playlist_id(), CachePolicy::UseCache)
+        .try_next()
         .await?
+        .ok_or_else(|| eyre!("expected Favorites detail snapshot"))?
+        .into_value()
         .playlist;
     assert_eq!(p.track_count, 0);
     assert!(p.entries.is_empty());

@@ -1,14 +1,19 @@
 //! Adapts the daemon’s SQLite store to the channel storage interface.
 
+use super::entity::song_favorites;
 use super::{Error, NamespaceStore, ServerStore};
 use mineral_channel_core::store::{
     AlbumCacheEntry, CachedPlaylistEntry, LibraryStore, NamespaceStore as ChannelStore,
     PlaylistCacheEntry, StoreError, StoreResult,
 };
+use mineral_channel_mineral::favorites_playlist_id;
+use mineral_model::CollectionIndex;
 use mineral_model::{
-    AlbumId, ArtistId, Envelope, Playlist, PlaylistId, Song, SongId, SourceKind, StoreValue,
+    Album, AlbumId, ArtistId, Envelope, Playlist, PlaylistId, Song, SongId, SourceKind, StoreValue,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use sea_orm::{EntityTrait, QueryOrder};
+use url::Url;
 
 impl From<Error> for StoreError {
     fn from(error: Error) -> Self {
@@ -27,6 +32,26 @@ impl From<Error> for StoreError {
 impl ChannelStore for NamespaceStore {
     fn source(&self) -> SourceKind {
         self.source()
+    }
+
+    async fn get_my_playlists_cache(&self) -> StoreResult<Option<Vec<Playlist>>> {
+        Self::get_my_playlists_cache(self).await.map_err(Into::into)
+    }
+
+    async fn put_my_playlists_cache(&self, playlists: &[Playlist]) -> StoreResult<()> {
+        Self::put_my_playlists_cache(self, playlists)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_my_albums_cache(&self) -> StoreResult<Option<Vec<Album>>> {
+        Self::get_my_albums_cache(self).await.map_err(Into::into)
+    }
+
+    async fn put_my_albums_cache(&self, albums: &[Album]) -> StoreResult<()> {
+        Self::put_my_albums_cache(self, albums)
+            .await
+            .map_err(Into::into)
     }
 
     async fn album_name(&self, id: &AlbumId) -> StoreResult<Option<String>> {
@@ -89,10 +114,11 @@ impl ChannelStore for NamespaceStore {
         &self,
         id: &PlaylistId,
         name: Option<&str>,
+        web_url: Option<&Url>,
         track_update_time: Option<i64>,
         entries: &[CachedPlaylistEntry],
     ) -> StoreResult<()> {
-        Self::put_playlist_cache(self, id, name, track_update_time, entries)
+        Self::put_playlist_cache(self, id, name, web_url, track_update_time, entries)
             .await
             .map_err(Into::into)
     }
@@ -132,6 +158,34 @@ impl ChannelStore for NamespaceStore {
 
 #[async_trait::async_trait]
 impl LibraryStore for ServerStore {
+    async fn playlist_entries(&self, id: &PlaylistId) -> StoreResult<Vec<CachedPlaylistEntry>> {
+        if *id != favorites_playlist_id() {
+            return self.user_playlist_entries(id).await.map_err(Into::into);
+        }
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let rows = song_favorites::Entity::find()
+            .order_by_desc(song_favorites::Column::EnteredAt)
+            .order_by_asc(song_favorites::Column::Namespace)
+            .order_by_asc(song_favorites::Column::SongValue)
+            .all(db)
+            .await
+            .map_err(|source| Error::Database {
+                operation: "read favorite membership",
+                source,
+            })?;
+        rows.into_iter()
+            .enumerate()
+            .map(|(position, row)| {
+                Ok(CachedPlaylistEntry {
+                    index: CollectionIndex::new(u64::try_from(position).map_err(Error::from)?),
+                    song_id: SongId::new(SourceKind::from_name(&row.namespace), row.song_value),
+                })
+            })
+            .collect()
+    }
+
     async fn user_playlists(&self) -> StoreResult<Vec<Playlist>> {
         Self::user_playlists(self).await.map_err(Into::into)
     }

@@ -1,0 +1,13 @@
+[package]
+name = "mineral-log"
+description = "tracing-based 日志门面 + 文件 appender"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-paths = { path = "../mineral-paths", version = "0.6.0" }
+thiserror = "1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "local-time", "chrono", "env-filter"] }

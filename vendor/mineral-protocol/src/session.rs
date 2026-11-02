@@ -13,8 +13,9 @@
 //!   「未提交」与「发送后结果未知」由 client 侧表达,不伪造为业务默认值。
 
 use mineral_audio::AudioSnapshot;
-use mineral_model::Song;
-use mineral_task::Snapshot;
+use mineral_common::revision::Revision;
+use mineral_model::{ArtistId, PlaylistId, SearchKind, Song, SourceKind};
+use mineral_task::{Priority, Snapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -67,8 +68,26 @@ impl RequestId {
 }
 
 /// 一次订阅声明的主题。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SubscriptionTopic {
+    /// 按需读取某位艺人的专辑列表。
+    ArtistAlbums(ArtistId),
+
+    /// 单次搜索的连续结果；来源内部保留分页位置。
+    Search {
+        /// 搜索来源。
+        source: SourceKind,
+
+        /// 实体类型。
+        kind: SearchKind,
+
+        /// 搜索词。
+        query: String,
+    },
+
+    /// 按需读取一个歌单的累计快照；使用 Advance 请求新鲜的下一批或完整内容。
+    Playlist(PlaylistId),
+
     /// 播放状态(队列 / 当前曲 / 歌词 / 媒体事实),按 [`PlayerSync`] 版本门控。
     Player,
 
@@ -89,6 +108,29 @@ pub enum SubscriptionTopic {
 
     /// 事件类别(Toast / Lifecycle / ServiceInfo / Task / Property)。
     Events(Subscription),
+}
+
+/// 一次订阅推进需要读取到的位置，不暴露来源的页码或游标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubscriptionDemand {
+    /// 读取到下一份新鲜的批次结果。
+    Next,
+
+    /// 持续读取到完整结果。
+    Complete,
+}
+
+/// 对现有订阅的需求；订阅的所有者和结果通道保持不变。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceSubscription {
+    /// 当前连接内的订阅。
+    pub subscription: SubscriptionId,
+
+    /// 本次需要下一批还是完整结果。
+    pub demand: SubscriptionDemand,
+
+    /// 本次取数的调度优先级。
+    pub priority: Priority,
 }
 
 /// 订阅请求:client 声明 id、主题与已持播放版本(Player 主题用于裁剪重段)。
@@ -179,7 +221,7 @@ pub struct UpdateEnvelope {
     pub subscription: SubscriptionId,
 
     /// 该订阅的单调版本(每次逻辑更新 +1)。
-    pub version: u64,
+    pub version: Revision,
 
     /// 本逻辑更新的总消息数(含自身);`1` 表示无需组装。
     pub parts: u32,
@@ -297,7 +339,7 @@ pub enum DownloadDetailUpdate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PcmChunk {
     /// 播放代次:起播 / seek / 切输入格式 / 上游断开时 +1;client 据此重置 FFT 窗口。
-    pub generation: u64,
+    pub generation: Revision,
 
     /// 本块首个样本的绝对流位置(样本数,单调)。
     pub position: u64,
@@ -396,6 +438,9 @@ pub enum SessionMessage {
     /// 取消订阅(旧 id 的后续更新由 client 忽略)。
     Unsubscribe(SubscriptionId),
 
+    /// 按需推进订阅中的流。
+    Advance(AdvanceSubscription),
+
     /// 客户端发现版本缺口 / 组装失败,请求重新快照。
     Resync(SubscriptionId),
 
@@ -448,7 +493,7 @@ pub const DOWNLOAD_DETAIL_PART_ROWS: usize = 512;
 ///   按发送顺序排列的消息。
 pub fn fragment_player_update(
     subscription: SubscriptionId,
-    version: u64,
+    version: Revision,
     mut sync: PlayerSync,
 ) -> Vec<SessionMessage> {
     let queue = sync.queue.take();
@@ -523,7 +568,7 @@ pub fn fragment_player_update(
 ///   按发送顺序排列的消息。
 pub fn fragment_download_detail(
     subscription: SubscriptionId,
-    version: u64,
+    version: Revision,
     rows: Vec<SongDownloadView>,
 ) -> Vec<SessionMessage> {
     let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);

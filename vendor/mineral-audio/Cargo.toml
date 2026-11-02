@@ -1,0 +1,25 @@
+[package]
+name = "mineral-audio"
+description = "音频播放引擎(Symphonia + CPAL)"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-common = { path = "../mineral-common", version = "0.6.0" }
+mineral-log = { path = "../mineral-log", version = "0.6.0" }
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+mineral-playback = { path = "../mineral-playback", version = "0.6.0" }
+thiserror = "1"
+derive-getters = "0.5"
+parking_lot = "0.12"
+ringbuf = "0.4"
+cpal = "0.17"
+rubato = "5.0.1"
+audioadapter-buffers = "5.1"
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["isomp4", "all-meta", "mpa", "aac", "alac", "aiff", "adpcm", "flac", "ogg", "vorbis", "wav", "pcm"] }
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+typed-builder = "0.20"

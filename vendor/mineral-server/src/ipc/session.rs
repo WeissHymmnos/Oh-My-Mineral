@@ -10,13 +10,17 @@ use mineral_protocol::{
     SessionResult, SocketWire, Wire, WireSink, WireSource,
 };
 #[cfg(unix)]
-use tokio::net::{UnixListener as IpcListener, UnixStream as IpcStream};
+type IpcListener = tokio::net::UnixListener;
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
 #[cfg(windows)]
-use tokio::net::{TcpListener as IpcListener, TcpStream as IpcStream};
+type IpcListener = tokio::net::TcpListener;
+#[cfg(windows)]
+type IpcStream = tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
 
+use super::connections::{ConnectionCounters, ConnectionLifetime};
 use super::dispatch;
-use super::registry::{ConnGuard, ConnRegistry};
 use super::subscriptions::Subscriptions;
 use crate::client::ClientHandle;
 use crate::publisher::DomainPublishers;
@@ -40,8 +44,8 @@ pub(crate) struct SessionServices {
     /// 业务句柄。
     pub(crate) client: ClientHandle,
 
-    /// 在线连接注册表。
-    pub(crate) registry: Arc<ConnRegistry>,
+    /// 连接 ID 分配与在线数量。
+    pub(crate) connections: Arc<ConnectionCounters>,
 
     /// 领域发布器。
     pub(crate) publishers: DomainPublishers,
@@ -60,22 +64,13 @@ pub(crate) async fn run(
 ) -> Result<(), crate::Error> {
     loop {
         let (stream, _addr) = listener.accept().await?;
-        #[cfg(windows)]
-        let _ = stream.set_nodelay(true);
-        let conn_id = services.registry.register();
+        let mut connection = services.connections.connect(&services.client);
+        let conn_id = connection.id;
         (services.on_connect)();
         mineral_log::info!(target: "ipc", conn_id, "client connected");
-        let client = services.client.for_connection(conn_id);
-        let guard = ConnGuard {
-            registry: Arc::clone(&services.registry),
-            id: conn_id,
-            client: client.clone(),
-        };
         let services = Arc::clone(&services);
         tokio::spawn(async move {
-            // 守卫持有到 task 结束:正常返回与 panic unwind 都从注册表移除。
-            let _guard = guard;
-            if let Err(e) = handle_connection(stream, conn_id, &services).await {
+            if let Err(e) = handle_connection(stream, &mut connection, &services).await {
                 mineral_log::warn!(target: "ipc", conn_id, error = mineral_log::chain(&e), "connection ended with error");
             }
         });
@@ -85,14 +80,14 @@ pub(crate) async fn run(
 /// 一条连接的完整生命周期:握手 → 拆半 → 读循环 + 发布泵 → 收尾。
 async fn handle_connection(
     stream: IpcStream,
-    conn_id: u64,
+    connection: &mut ConnectionLifetime,
     services: &SessionServices,
 ) -> Result<(), ConnectionError> {
     let mut wire = Box::new(SocketWire::from_stream(stream));
     let Some(info) = handshake(&mut *wire, &services.client).await? else {
         return Ok(());
     };
-    services.registry.set_identity(conn_id, info.clone());
+    connection.identity = Some(info);
     let (sink, source) = wire.split();
     let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(writer_loop(sink, out_rx));
@@ -199,7 +194,14 @@ async fn read_loop(
             match message {
                 SessionMessage::Requests(requests) => {
                     for request in requests {
-                        handle_request(request, client, out, &services.shutdown).await;
+                        handle_request(
+                            request,
+                            client,
+                            out,
+                            &services.shutdown,
+                            &mut subscriptions,
+                        )
+                        .await;
                     }
                 }
                 SessionMessage::Subscribe(request) => {
@@ -209,6 +211,7 @@ async fn read_loop(
                     subscriptions.unsubscribe(id, services.publishers.pcm());
                 }
                 SessionMessage::Resync(id) => subscriptions.resync(id),
+                SessionMessage::Advance(request) => subscriptions.advance(request),
                 SessionMessage::Close(_reason) => {
                     subscriptions.shutdown(services.publishers.pcm());
                     return;
@@ -228,6 +231,7 @@ async fn handle_request(
     client: &ClientHandle,
     out: &mpsc::Sender<SessionMessage>,
     shutdown: &Arc<Notify>,
+    subscriptions: &mut Subscriptions,
 ) {
     let id = request.id;
     if let Some(slow) = dispatch::async_request(&request.request) {
@@ -242,6 +246,7 @@ async fn handle_request(
         return;
     }
     let result = match request.request {
+        Request::StopDownload(id) => dispatch::execute_stop_download(client, &id).await,
         Request::SetAudioOutput(target) => match client.set_audio_output(target).await {
             Ok(()) => mineral_protocol::OperationResult::Applied,
             Err(error) => dispatch::failure(&error, dispatch::audio_failure_kind(&error)),
@@ -253,8 +258,15 @@ async fn handle_request(
         },
         Request::QueueEdit { op } => dispatch::execute_queue_edit(client, op).await,
         other => {
+            if let Request::RefreshCollections(scope) = &other {
+                subscriptions.invalidate(scope).await;
+            }
             let is_shutdown = matches!(other, Request::Shutdown);
+            let invalidates_collections = matches!(other, Request::RefreshCollections(_));
             let result = dispatch::execute_sync(client, other);
+            if invalidates_collections {
+                subscriptions.flush_task_events().await;
+            }
             if is_shutdown {
                 // ack 先入队、再唤醒关停:给 writer 把应答写出去的机会。
                 let _ = out

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mineral_audio::{AudioHandle, AudioSnapshot};
+use mineral_common::revision::Revision;
 use mineral_protocol::{
     DownloadDetailDelta, DownloadDetailUpdate, DownloadSummary, Event, SongDownloadView,
 };
@@ -30,9 +31,6 @@ const TASKS_SAMPLE_MS: u64 = 250;
 
 /// 下载摘要采样节奏。
 const DOWNLOADS_SUMMARY_SAMPLE_MS: u64 = 250;
-
-/// 下载明细变更去抖(合并连续进度)。
-const DOWNLOADS_DETAIL_DEBOUNCE_MS: u64 = 100;
 
 /// 会话可订阅的全部领域发布源。
 #[derive(Clone)]
@@ -141,6 +139,7 @@ fn spawn_playback_publisher(audio: AudioHandle) -> watch::Receiver<Arc<AudioSnap
             let signature = PlaybackSignature::of(&snapshot);
             let changed = last_signature.as_ref() != Some(&signature);
             let reanchor = snapshot.playing
+                && !snapshot.buffering
                 && last_sent.elapsed() >= Duration::from_millis(PLAYBACK_REANCHOR_MS);
             if changed || reanchor {
                 last_signature = Some(signature);
@@ -152,7 +151,7 @@ fn spawn_playback_publisher(audio: AudioHandle) -> watch::Receiver<Arc<AudioSnap
     rx
 }
 
-/// 播放状态签名:位置之外的一切(位置由 client 本地推进,不进签名)。
+/// 连续播放的位置由 client 外推；暂停或缓冲期间的位置变化必须立即发布。
 #[derive(PartialEq, Eq)]
 struct PlaybackSignature {
     /// Successfully opened output device and stream configuration.
@@ -160,6 +159,12 @@ struct PlaybackSignature {
 
     /// 是否在出声。
     playing: bool,
+
+    /// Whether PCM supply has temporarily stopped media progress.
+    buffering: bool,
+
+    /// Seek remains observable while no media frames are being rendered.
+    stationary_position_ms: Option<u64>,
 
     /// 时长。
     duration_ms: Option<u64>,
@@ -174,7 +179,7 @@ struct PlaybackSignature {
     backend: mineral_audio::AudioBackend,
 
     /// 轨道令牌。
-    current_track_token: u64,
+    current_track_token: Revision,
 
     /// 预排时长。
     next_duration_ms: Option<u64>,
@@ -195,6 +200,9 @@ impl PlaybackSignature {
         Self {
             output: snapshot.output.clone(),
             playing: snapshot.playing,
+            buffering: snapshot.buffering,
+            stationary_position_ms: (!snapshot.playing || snapshot.buffering)
+                .then_some(snapshot.position_ms),
             duration_ms: snapshot.duration_ms,
             volume_pct: snapshot.volume_pct,
             track_finished_seq: snapshot.track_finished_seq,
@@ -236,22 +244,23 @@ type DownloadStreams = (
     broadcast::Sender<Arc<DownloadDetailDelta>>,
 );
 
-/// 下载摘要 / 明细发布:摘要变化才发;明细按变更通知去抖后产增量包。
+/// 下载摘要变化才发布；明细使用管理任务已合并的快照生成增量包。
 fn spawn_downloads_publishers(player: &PlayerCore) -> DownloadStreams {
-    let (summary_tx, summary_rx) = watch::channel(Arc::new(player.download_summary()));
+    let snapshots = player.download_snapshots();
+    let (summary_tx, summary_rx) = watch::channel(Arc::new(snapshots.borrow().summary.clone()));
     let (detail_tx, detail_rx) = watch::channel(None);
     let (delta_tx, _delta_rx) =
         broadcast::channel::<Arc<DownloadDetailDelta>>(/*capacity*/ 64);
 
     {
-        let player = player.clone();
+        let snapshots = snapshots.clone();
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(Duration::from_millis(DOWNLOADS_SUMMARY_SAMPLE_MS));
             let mut last = DownloadSummary::default();
             loop {
                 tick.tick().await;
-                let summary = player.download_summary();
+                let summary = snapshots.borrow().summary.clone();
                 if summary != last {
                     last = summary.clone();
                     let _ = summary_tx.send(Arc::new(summary));
@@ -260,24 +269,21 @@ fn spawn_downloads_publishers(player: &PlayerCore) -> DownloadStreams {
         });
     }
     {
-        let player = player.clone();
         let delta_tx = delta_tx.clone();
         tokio::spawn(async move {
-            let mut changes = player.download_changes();
-            let mut published: Vec<SongDownloadView> = Vec::new();
+            let mut snapshots = snapshots;
+            let mut published = Arc::new(Vec::new());
             let mut initialized = false;
             loop {
-                if changes.changed().await.is_err() {
+                if snapshots.changed().await.is_err() {
                     return;
                 }
-                // 去抖:连续进度合并成一次发布。
-                tokio::time::sleep(Duration::from_millis(DOWNLOADS_DETAIL_DEBOUNCE_MS)).await;
-                let rows = player.download_snapshot();
+                let rows = Arc::clone(&snapshots.borrow_and_update().rows);
                 let delta = diff_downloads(&published, &rows, initialized);
                 initialized = true;
-                published = rows.clone();
+                published = Arc::clone(&rows);
                 if delta.order.is_some() || !delta.changes.is_empty() {
-                    let _ = detail_tx.send(Some(Arc::new(rows)));
+                    let _ = detail_tx.send(Some(rows));
                     let _ = delta_tx.send(Arc::new(delta));
                 }
             }

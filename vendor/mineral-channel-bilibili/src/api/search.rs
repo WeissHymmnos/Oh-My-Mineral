@@ -1,0 +1,97 @@
+//! 视频搜索端点(`wbi/search/type`,WBI 签名 + 需 buvid3)。
+
+use mineral_channel_core::PageResult;
+use mineral_model::{Album, Artist};
+
+use crate::Result;
+use crate::convert::{search_user_to_artist, search_video_to_album};
+use crate::transport::Transport;
+use crate::wire::de::from_value;
+use crate::wire::search::{SearchResult, UserSearchResult};
+
+/// 视频搜索端点。
+const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
+
+/// 搜视频 → 一页 `Album` 命中(B站一个视频 BV = 一张专辑;缺 bvid 的项被 convert 丢弃)。
+///
+/// `page_size` 显式下发(上限 50,不发则服务端默认 ~20);「还有下一页吗」从响应的
+/// `numPages` 算出——本页条数会被 convert 过滤缩水,不能当翻页依据。
+///
+/// # Params:
+///   - `transport`: HTTP 传输层
+///   - `keyword`: 搜索关键词
+///   - `page`: 页码(从 1 起)
+///   - `page_size`: 每页条数
+///
+/// # Return:
+///   命中视频映射成的专辑页(带显式 `has_more`)。
+pub async fn search_albums(
+    transport: &Transport,
+    keyword: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<PageResult<Album>> {
+    let data = transport
+        .get_signed(
+            SEARCH_URL,
+            vec![
+                ("search_type", "video".to_owned()),
+                ("keyword", keyword.to_owned()),
+                ("page", page.to_string()),
+                ("page_size", page_size.to_string()),
+                ("order", "totalrank".to_owned()),
+            ],
+        )
+        .await?;
+    let result: SearchResult = from_value(data)?;
+    let items = result
+        .result
+        .into_iter()
+        .filter_map(|item| search_video_to_album(item).transpose())
+        .collect::<Result<Vec<Album>>>()?;
+    Ok(PageResult {
+        items,
+        has_more: result.num_pages.map(|total| page < total),
+    })
+}
+
+/// 搜用户(`search_type=bili_user`)→ 一页 `Artist` 命中(缺 mid 的项被 convert 丢弃)。
+///
+/// 分页语义同 [`search_albums`]:`has_more` 从 `numPages` 算,不看本页条数。
+///
+/// # Params:
+///   - `transport`: HTTP 传输层
+///   - `keyword`: 搜索关键词
+///   - `page`: 页码(从 1 起)
+///   - `page_size`: 每页条数
+///
+/// # Return:
+///   命中用户映射成的艺人页(带显式 `has_more`)。
+pub async fn search_artists(
+    transport: &Transport,
+    keyword: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<PageResult<Artist>> {
+    let data = transport
+        .get_signed(
+            SEARCH_URL,
+            vec![
+                ("search_type", "bili_user".to_owned()),
+                ("keyword", keyword.to_owned()),
+                ("page", page.to_string()),
+                ("page_size", page_size.to_string()),
+            ],
+        )
+        .await?;
+    let result: UserSearchResult = from_value(data)?;
+    let items = result
+        .result
+        .into_iter()
+        .filter_map(|item| search_user_to_artist(item).transpose())
+        .collect::<Result<Vec<Artist>>>()?;
+    Ok(PageResult {
+        items,
+        has_more: result.num_pages.map(|total| page < total),
+    })
+}

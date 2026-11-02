@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::persistence::ServerStore;
 use async_trait::async_trait;
-use mineral_channel_core::{ChannelCaps, Error, MusicChannel, Page, PageResult};
-use mineral_model::{Album, AlbumId, Lyrics, Playlist, PlaylistId, Song, SongId, SourceKind};
+use mineral_channel_core::{ChannelCaps, CollectionStream, Error, MusicChannel, fresh_collection};
+use mineral_model::{CachePolicy, Lyrics, Playlist, PlaylistId, Song, SongId, SourceKind};
 use mineral_test::song;
 use pretty_assertions::assert_eq;
 
@@ -51,38 +51,11 @@ impl MusicChannel for WritableChannel {
             .build()
     }
 
-    async fn search_songs(
+    async fn songs_detail(
         &self,
-        _q: &str,
-        _p: Page,
-    ) -> mineral_channel_core::Result<PageResult<Song>> {
-        Err(Error::NotSupported)
-    }
-    async fn search_albums(
-        &self,
-        _q: &str,
-        _p: Page,
-    ) -> mineral_channel_core::Result<PageResult<Album>> {
-        Err(Error::NotSupported)
-    }
-    async fn search_playlists(
-        &self,
-        _q: &str,
-        _p: Page,
-    ) -> mineral_channel_core::Result<PageResult<Playlist>> {
-        Err(Error::NotSupported)
-    }
-    async fn songs_detail(&self, _ids: &[SongId]) -> mineral_channel_core::Result<Vec<Song>> {
-        Err(Error::NotSupported)
-    }
-    async fn album_detail(&self, _id: &AlbumId) -> mineral_channel_core::Result<Album> {
-        Err(Error::NotSupported)
-    }
-    async fn playlist_detail(
-        &self,
-        _id: &PlaylistId,
-        _load: mineral_channel_core::PlaylistLoad,
-    ) -> mineral_channel_core::Result<mineral_channel_core::PlaylistDetail> {
+        _ids: &[SongId],
+        _cache: CachePolicy,
+    ) -> mineral_channel_core::Result<Vec<Song>> {
         Err(Error::NotSupported)
     }
     async fn lyrics(&self, _id: &SongId) -> mineral_channel_core::Result<Lyrics> {
@@ -96,13 +69,15 @@ impl MusicChannel for WritableChannel {
             .build())
     }
 
-    async fn my_playlists(&self) -> mineral_channel_core::Result<Vec<Playlist>> {
-        Ok(vec![
-            Playlist::builder()
-                .id(PlaylistId::new(SourceKind::NETEASE, "created-1"))
-                .name(String::from("新歌单"))
-                .build(),
-        ])
+    fn my_playlists(&self, _cache: CachePolicy) -> CollectionStream<'_, Playlist> {
+        fresh_collection(async {
+            Ok(vec![
+                Playlist::builder()
+                    .id(PlaylistId::new(SourceKind::NETEASE, "created-1"))
+                    .name(String::from("新歌单"))
+                    .build(),
+            ])
+        })
     }
 }
 
@@ -346,7 +321,7 @@ async fn library_playlists_query_parks_until_complete() -> color_eyre::Result<()
         liked_ids: None,
         playlists: Some(vec![named_playlist("p1", "日常")]),
     })];
-    let (runtime, pumps) = parts.spawn_runtime(watchdog, &channels);
+    let (runtime, pumps) = parts.spawn_runtime(watchdog);
     let _runtime = runtime.ok_or_else(|| color_eyre::eyre::eyre!("应有脚本线程"))?;
     let (hub_tx, _hub_rx) = tokio::sync::broadcast::channel(/*capacity*/ 8);
     let core = core_with_events(

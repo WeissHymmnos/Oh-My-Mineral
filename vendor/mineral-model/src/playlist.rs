@@ -1,0 +1,69 @@
+use derive_getters::Getters;
+use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
+use url::Url;
+
+use crate::{collection::PlaylistEntry, ids::PlaylistId, source::SourceKind, url::MediaUrl};
+
+/// 当前客户端可请求的歌单管理操作。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistActions {
+    /// 允许改名。
+    pub rename: bool,
+
+    /// 允许删除。
+    pub delete: bool,
+}
+
+/// 一个歌单及其曲目。
+///
+/// 构造走 [`Playlist::builder`](Playlist::builder)(`#[non_exhaustive]`);读取走 getter。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TypedBuilder, Getters)]
+#[non_exhaustive]
+pub struct Playlist {
+    /// 歌单 ID(自带 namespace,在其来源内唯一)。
+    pub id: PlaylistId,
+
+    /// 歌单名。
+    pub name: String,
+
+    /// 服务端提供的操作资格；执行时仍由服务端校验。
+    #[builder(default)]
+    pub actions: PlaylistActions,
+
+    /// 简介,拿不到给空。
+    #[builder(default)]
+    pub description: String,
+
+    /// 封面 URL。
+    #[builder(default)]
+    pub cover_url: Option<MediaUrl>,
+
+    /// 此歌单的网页分享地址；私人或纯本地歌单可以没有公开页面。
+    #[builder(default)]
+    pub web_url: Option<Url>,
+
+    /// 标称曲目数(可能与 `entries.len()` 不一致——分页或仅头部加载时)。
+    #[builder(default)]
+    pub track_count: u64,
+
+    /// 播放量,拿不到给 `None`。
+    #[builder(default)]
+    pub play_count: Option<u64>,
+
+    /// 收藏 / 订阅数(多少用户收藏了此 playlist),拿不到给 `None`。
+    #[builder(default)]
+    pub subscriber_count: Option<u64>,
+
+    /// 已加载的 membership relation；每项保留 canonical snapshot 中的 0-based absolute index。
+    #[builder(default)]
+    pub entries: Vec<PlaylistEntry>,
+}
+
+impl Playlist {
+    /// 来源(source)——派生自 [`Playlist::id`] 的 namespace。
+    #[inline]
+    pub fn source(&self) -> SourceKind {
+        self.id.namespace()
+    }
+}

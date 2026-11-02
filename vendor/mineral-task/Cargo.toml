@@ -1,0 +1,21 @@
+[package]
+name = "mineral-task"
+description = "异步任务调度器"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-channel-core = { path = "../mineral-channel-core", version = "0.6.0" }
+mineral-common = { path = "../mineral-common", version = "0.6.0" }
+mineral-log = { path = "../mineral-log", version = "0.6.0" }
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+async-stream = "0.3"
+async-trait = "0.1"
+thiserror = "1"
+futures-util = "0.3"
+parking_lot = "0.12"
+rustc-hash = "2"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }

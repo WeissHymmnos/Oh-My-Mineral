@@ -9,16 +9,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use mineral_audio::OutputTarget;
-use mineral_channel_core::{Page, PlaylistLoad};
 use mineral_client::connection::ClientConfig;
 use mineral_client::Client;
 use mineral_model::{
-    AlbumId, ArtistId, Lyrics, PlaylistId, SearchKind, Song, SongId, SourceKind,
+    AlbumId, ArtistId, CollectionCategory, Lyrics, PlaylistId, RefreshScope, SearchKind, Song,
+    SongId, SourceKind,
 };
 use mineral_paths::socket_path;
 use mineral_protocol::{
-    Event, FailureKind, PlayMode, QueueAnchor, QueueContextWire, QueueOp, QueuePos, Request,
-    Subscription, SubscriptionTopic,
+    AdvanceSubscription, Event, FailureKind, PlayMode, QueueAnchor, QueueContextWire, QueueOp,
+    QueuePos, Request, Subscription, SubscriptionDemand, SubscriptionTopic,
 };
 use mineral_task::{ChannelFetchKind, Priority, TaskEvent, TaskKind};
 use serde_json::{json, Value};
@@ -154,6 +154,7 @@ fn song_json(song: &Song, loved: &HashMap<String, bool>) -> Value {
         "album": song.album.as_ref().map(|album| album.name.clone()).unwrap_or_default(),
         "duration_ms": song.duration_ms,
         "cover_url": cover_of(source_name, &song.cover_url),
+        "web_url": song.web_url.as_ref().map(ToString::to_string),
         "source": source_name,
         "source_label": clean_label(song.source().label()),
         "unavailable": song.unavailable,
@@ -206,6 +207,7 @@ fn playlist_json(playlist: &mineral_model::Playlist) -> Value {
         "source": source_name,
         "source_label": clean_label(playlist.source().label()),
         "cover_url": cover_of(source_name, &playlist.cover_url),
+        "web_url": playlist.web_url.as_ref().map(ToString::to_string),
         "track_count": playlist.track_count,
     })
 }
@@ -222,6 +224,7 @@ fn album_json(album: &mineral_model::Album) -> Value {
         "source": source_name,
         "source_label": clean_label(album.source().label()),
         "cover_url": cover_of(source_name, &album.cover_url),
+        "web_url": album.web_url.as_ref().map(ToString::to_string),
     })
 }
 
@@ -236,6 +239,7 @@ fn artist_json(artist: &mineral_model::Artist) -> Value {
         "source": source_name,
         "source_label": clean_label(artist.source().label()),
         "cover_url": cover_of(source_name, &artist.avatar_url),
+        "web_url": artist.web_url.as_ref().map(ToString::to_string),
     })
 }
 
@@ -247,6 +251,7 @@ struct App {
     launched: Option<tokio::process::Child>,
     last_player_sig: Value,
     last_downloads_sig: Value,
+    active_playlist_sub: Option<SubscriptionTopic>,
 }
 
 impl App {
@@ -259,6 +264,7 @@ impl App {
             launched: None,
             last_player_sig: Value::Null,
             last_downloads_sig: Value::Null,
+            active_playlist_sub: None,
         }
     }
 
@@ -290,6 +296,7 @@ impl App {
         self.client = Some(client);
         self.last_player_sig = Value::Null;
         self.last_downloads_sig = Value::Null;
+        self.active_playlist_sub = None;
         emit(json!({
             "event": "connection",
             "connected": true,
@@ -333,11 +340,11 @@ impl App {
         }
         let mut candidates = Vec::new();
         if let Ok(exe) = std::env::current_exe() {
+            candidates.push(exe.clone());
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join("mineral"));
                 candidates.push(dir.join("mineral.exe"));
             }
-            candidates.push(exe);
         }
         candidates.push(std::path::PathBuf::from("/usr/bin/mineral"));
         candidates.push(std::path::PathBuf::from("/usr/local/bin/mineral"));
@@ -603,7 +610,11 @@ impl App {
                 }
                 emit(json!({"event":"loved","source":source.name(),"keys":keys}));
             }
-            TaskEvent::PlaylistDetailFetched { id, detail, .. } => {
+            TaskEvent::PlaylistDetailFetched {
+                id,
+                fresh,
+                detail,
+            } => {
                 let rows: Vec<Value> = detail
                     .playlist
                     .entries
@@ -616,7 +627,7 @@ impl App {
                     "kind": "playlist",
                     "title": detail.playlist.name,
                     "rows": rows,
-                    "complete": detail.complete,
+                    "complete": fresh && detail.complete,
                 }));
             }
             TaskEvent::PlaylistDetailFailed { id, .. } => {
@@ -670,7 +681,7 @@ impl App {
                     "error": "音源不可用或未登录",
                 }));
             }
-            TaskEvent::AlbumDetailFetched { id, album } => {
+            TaskEvent::AlbumDetailFetched { id, fresh, album } => {
                 let rows: Vec<Value> = album
                     .tracks
                     .iter()
@@ -684,6 +695,7 @@ impl App {
                     "title": album.name,
                     "rows": rows,
                     "cover_url": cover_of(&src, &album.cover_url),
+                    "complete": fresh,
                 }));
             }
             TaskEvent::AlbumDetailFailed { id } => {
@@ -750,6 +762,17 @@ impl App {
         let cmd = msg.get("cmd").and_then(Value::as_str).unwrap_or("");
         match cmd {
             "connect" => self.connect().await,
+            "refresh" => {
+                if let Some(client) = self.client() {
+                    let _ = client.try_fire(Request::RefreshCollections(
+                        RefreshScope::Collections(CollectionCategory::Playlists),
+                    ));
+                    let _ = client.try_fire(Request::RefreshCollections(
+                        RefreshScope::Collections(CollectionCategory::Albums),
+                    ));
+                }
+                self.refresh_caps().await;
+            }
             "launch_daemon" => self.launch_daemon().await,
             "shutdown_daemon" => {
                 if let Some(client) = self.client() {
@@ -1131,7 +1154,6 @@ impl App {
                     source,
                     kind,
                     query: query.clone(),
-                    page: Page::new(0, 30),
                 }),
                 Priority::User,
             ));
@@ -1139,7 +1161,7 @@ impl App {
     }
 
     async fn open(&mut self, msg: &Value) {
-        let Some(client) = self.client() else {
+        if self.client().is_none() {
             emit(json!({"event":"notice","level":"error","text":"Daemon 断连，无法打开"}));
             return;
         };
@@ -1148,17 +1170,43 @@ impl App {
         match kind {
             "playlist" => {
                 if let Some(id) = playlist_id(key) {
-                    let _ = client.try_fire(Request::SubmitTask(
-                        TaskKind::ChannelFetch(ChannelFetchKind::PlaylistDetail {
-                            id,
-                            load: PlaylistLoad::Complete,
-                        }),
-                        Priority::User,
-                    ));
+                    if let Some(prev_topic) = self.active_playlist_sub.take()
+                        && let Some(client) = self.client()
+                    {
+                        let _ = client.unsubscribe(&prev_topic);
+                    }
+                    let topic = SubscriptionTopic::Playlist(id.clone());
+                    let subscribed = self.client().map(|client| client.subscribe(topic.clone()));
+                    if let Some(res) = subscribed {
+                        match res {
+                            Ok(subscription) => {
+                                self.active_playlist_sub = Some(topic);
+                                if let Some(client) = self.client() {
+                                    let _ = client.advance(AdvanceSubscription {
+                                        subscription,
+                                        demand: SubscriptionDemand::Complete,
+                                        priority: Priority::User,
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(client) = self.client() {
+                                    let _ = client.try_fire(Request::SubmitTask(
+                                        TaskKind::ChannelFetch(ChannelFetchKind::PlaylistDetail {
+                                            id,
+                                        }),
+                                        Priority::User,
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             "album" => {
-                if let Some(id) = album_id(key) {
+                if let Some(id) = album_id(key)
+                    && let Some(client) = self.client()
+                {
                     let _ = client.try_fire(Request::SubmitTask(
                         TaskKind::ChannelFetch(ChannelFetchKind::AlbumDetail { id }),
                         Priority::User,
@@ -1166,22 +1214,23 @@ impl App {
                 }
             }
             "artist" => {
-                if let Some(id) = artist_id(key) {
+                if let Some(id) = artist_id(key)
+                    && let Some(client) = self.client()
+                {
                     let _ = client.try_fire(Request::SubmitTask(
                         TaskKind::ChannelFetch(ChannelFetchKind::ArtistDetail { id: id.clone() }),
                         Priority::User,
                     ));
                     let _ = client.try_fire(Request::SubmitTask(
-                        TaskKind::ChannelFetch(ChannelFetchKind::ArtistAlbums {
-                            id,
-                            page: Page::new(0, 30),
-                        }),
+                        TaskKind::ChannelFetch(ChannelFetchKind::ArtistAlbums { id }),
                         Priority::User,
                     ));
                 }
             }
             "song" => {
-                if let Some(id) = song_id(key) {
+                if let Some(id) = song_id(key)
+                    && let Some(client) = self.client()
+                {
                     let _ = client.try_fire(Request::SubmitTask(
                         TaskKind::ChannelFetch(ChannelFetchKind::Lyrics { song_id: id }),
                         Priority::User,
@@ -1273,6 +1322,32 @@ fn netease_config_from(
         .build()
 }
 
+fn apple_music_config_from(
+    section: &mineral_server::config::AppleMusicSection,
+) -> mineral_channel_apple_music::AppleMusicConfig {
+    mineral_channel_apple_music::AppleMusicConfig::builder()
+        .proxy(section.proxy().clone())
+        .timeout_secs(*section.timeout_secs())
+        .developer_token_cache_ttl(Duration::from_secs(
+            u64::from(section.developer_token_cache_ttl_days().get()) * 24 * 60 * 60,
+        ))
+        .lyrics_translation_language(section.lyrics_translation_language().clone())
+        .lyrics_romanization_script(section.lyrics_romanization_script().clone())
+        .album_cache(
+            mineral_channel_apple_music::AlbumCacheConfig::builder()
+                .ttl_days(*section.album_cache().ttl_days())
+                .ttl_jitter_days(*section.album_cache().ttl_jitter_days())
+                .build(),
+        )
+        .device_file(section.device_file().clone())
+        .media_concurrency(*section.media_concurrency())
+        .startup_buffer(Duration::from_secs(u64::from(
+            section.startup_buffer_secs().get(),
+        )))
+        .fragment_header_prefetch_bytes(*section.fragment_header_prefetch_bytes())
+        .build()
+}
+
 fn bilibili_config_from(
     section: &mineral_server::config::BilibiliSection,
 ) -> mineral_channel_bilibili::BilibiliConfig {
@@ -1295,7 +1370,18 @@ fn run_channel_login(channel_id: &str) {
         let Ok((config, _)) = mineral_server::config::load_daemon(&daemon_path) else {
             return 1;
         };
-        if channel_id == "bilibili" {
+        if channel_id == "am" || channel_id == "apple-music" {
+            let am = apple_music_config_from(config.sources().am());
+            let cli = mineral_channel_apple_music::cli::AppleMusicCli {
+                command: mineral_channel_apple_music::cli::AppleMusicCommand::Login,
+            };
+            let exit = mineral_channel_apple_music::cli::run(cli, &am).await;
+            if exit == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            }
+        } else if channel_id == "bilibili" {
             let bc = bilibili_config_from(config.sources().bilibili());
             let cli = mineral_channel_bilibili::cli::BilibiliCli {
                 command: mineral_channel_bilibili::cli::BilibiliCommand::Login,
@@ -1374,6 +1460,18 @@ fn serve_embedded_daemon() {
             channels.push(lib.clone());
             providers.push(lib);
         }
+        if let Ok(Some(auth)) = mineral_channel_apple_music::load_stored() {
+            let am = apple_music_config_from(config.sources().am());
+            if let Ok(ch) = mineral_channel_apple_music::AppleMusicChannel::with_credential(
+                &am,
+                auth,
+                Some(std::sync::Arc::new(persist.scope(SourceKind::APPLE_MUSIC))),
+            ) {
+                let arc = std::sync::Arc::new(ch);
+                channels.push(arc.clone());
+                providers.push(arc);
+            }
+        }
         if let Ok(Some(auth)) = mineral_channel_netease::load_stored() {
             let nc = netease_config_from(config.sources().netease());
             if let Ok(ch) = mineral_channel_netease::NeteaseChannel::with_credential(
@@ -1390,9 +1488,11 @@ fn serve_embedded_daemon() {
         {
             let bc = bilibili_config_from(config.sources().bilibili());
             let ch_res = match mineral_channel_bilibili::load_stored() {
-                Ok(Some(auth)) => {
-                    mineral_channel_bilibili::BilibiliChannel::with_credential(&bc, &auth)
-                }
+                Ok(Some(auth)) => mineral_channel_bilibili::BilibiliChannel::with_credential(
+                    &bc,
+                    &auth,
+                    Some(std::sync::Arc::new(persist.scope(SourceKind::BILIBILI))),
+                ),
                 _ => mineral_channel_bilibili::BilibiliChannel::new(&bc),
             };
             if let Ok(ch) = ch_res {
@@ -1412,7 +1512,11 @@ fn serve_embedded_daemon() {
         let Ok(sock_path) = socket_path() else {
             return;
         };
-        if mineral_protocol::SocketWire::connect(&sock_path).await.is_ok() {
+        if let Ok(wire) = mineral_protocol::SocketWire::connect(&sock_path).await
+            && Client::from_wire(Box::new(wire), "mineral-probe", ClientConfig::default())
+                .await
+                .is_ok()
+        {
             return;
         }
         let _ = tokio::fs::remove_file(&sock_path).await;
@@ -1446,7 +1550,7 @@ fn serve_embedded_daemon() {
             .hard_wall(Duration::from_millis(*config.script().watchdog_hard_wall_ms()))
             .build();
         let script_sender = script.sender().clone();
-        let (script_runtime, pumps) = script.spawn_runtime(watchdog, sources.channels());
+        let (script_runtime, pumps) = script.spawn_runtime(watchdog);
         let stats_store = match mineral_paths::data_dir() {
             Ok(d) => mineral_stats::StatsStore::open(&d.join("stats.db"))
                 .await
@@ -1547,6 +1651,10 @@ async fn run_bridge() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("mineral 0.6.0");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("serve") {
         serve_embedded_daemon();
         return;

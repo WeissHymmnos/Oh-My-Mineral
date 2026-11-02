@@ -42,7 +42,7 @@ fn audit_request(req: &Request) -> TrackingDecision {
             NotAnEvent("session control: recorded in audio structured logs")
         }
         Request::SetVolume(..) => Recorded("volume_changes"),
-        Request::SubmitTask(..) => {
+        Request::SubmitTask(..) | Request::RefreshCollections(..) => {
             NotAnEvent("任务提交;取数事件在 task 终态记,见 audit_fetch_kind")
         }
         Request::PlaySong(..) => Recorded("plays"),
@@ -166,7 +166,7 @@ fn audit_behavior_emitters(event: &BehaviorEvent) -> &'static str {
         BehaviorEvent::BusMessage { .. } => "仅历史数据:脚本事件总线已删除",
         BehaviorEvent::FullscreenChange { .. } => "ipc dispatch 的 TerminalState",
         BehaviorEvent::ConnectionReject { .. } => "ipc::handshake record_connection_reject",
-        BehaviorEvent::ClientConnection { .. } => "ipc::ConnGuard drop",
+        BehaviorEvent::ClientConnection { .. } => "ipc::connections::ConnectionLifetime drop",
         BehaviorEvent::AppLifecycle { .. } => "recorder.daemon_lifecycle + ipc 会话生命周期",
     }
 }

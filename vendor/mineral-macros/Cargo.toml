@@ -1,0 +1,10 @@
+[package]
+name = "mineral-macros"
+description = "Mineral 内部 macros"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }

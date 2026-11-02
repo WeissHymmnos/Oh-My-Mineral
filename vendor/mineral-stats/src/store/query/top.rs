@@ -1,0 +1,838 @@
+//! 排行榜:歌曲 / 专辑 / 艺人 / 单曲循环 / 队列语境。
+
+use std::ops::Range;
+
+use crate::PlayMode;
+use crate::entity::{plays, song_artists, songs};
+use mineral_model::{AlbumId, ArtistId, SourceKind};
+use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::{ColumnTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, Select};
+
+use crate::report::{ContextSlice, ReportOptions, TopAlbum, TopArtist, TopBy, TopSong};
+use crate::store::StatsStore;
+
+use super::shared::{ReportColumn, artist_dimension, plays_in, song_dimension, song_id};
+
+/// `top_songs` / `top_repeat_songs` 的每行;`song` 由 ns+value 重建故经中转。
+#[derive(sea_orm::FromQueryResult)]
+struct TopSongRow {
+    /// 来源 name。
+    ns: String,
+
+    /// 裸歌曲 id。
+    song_value: String,
+
+    /// 播放次数。
+    plays: i64,
+
+    /// 累计收听 ms。
+    listen_ms: i64,
+
+    /// songs 维表回查的歌名;未覆盖为 `None`。
+    name: Option<String>,
+}
+
+/// `top_albums`(口味口径)的每行:按 `songs` 的 `album_id` 聚合。
+#[derive(sea_orm::FromQueryResult)]
+struct TopAlbumRow {
+    /// 来源 name。
+    ns: String,
+
+    /// 专辑裸 id。
+    album_id: String,
+
+    /// 专辑名;`songs.album_name` 无 NOT NULL 约束(理论上应与 `album_id` 成对出现),
+    /// `MAX` 兼给 SQLite 一个确定性取值。
+    album_name: Option<String>,
+
+    /// 该专辑内歌曲的播放次数。
+    plays: i64,
+
+    /// 累计收听 ms。
+    listen_ms: i64,
+}
+
+/// `top_artists`(口味口径)的每行:按 `song_artists` 的 `artist_value` 聚合。
+#[derive(sea_orm::FromQueryResult)]
+struct TopArtistRow {
+    /// 来源 name。
+    ns: String,
+
+    /// 艺人裸值。
+    artist_value: String,
+
+    /// 艺人名(维表恒非空,`MAX` 只为在多行同 `artist_value` 时给 SQLite 一个确定性取值,
+    /// 不是「缺失回填」——与 `top_contexts` 的 `MAX(context_name)` 目的不同)。
+    artist_name: String,
+
+    /// 播放次数(合作曲对每位艺人各记一次)。
+    plays: i64,
+
+    /// 累计收听 ms(合作曲对每位艺人各记全量,非按人数折算)。
+    listen_ms: i64,
+}
+
+impl StatsStore {
+    /// top 歌曲(次数 / 时长双口径)。`options.min_listen_ms` 过滤有效播放行。
+    pub async fn top_songs(
+        &self,
+        range: Range<i64>,
+        by: TopBy,
+        options: &ReportOptions,
+    ) -> crate::Result<Vec<TopSong>> {
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let query =
+            song_ranking(range).filter(plays::Column::ListenMs.gte(options.min_listen_ms()));
+        let rows = rank(query, by, options.top_limit())
+            .into_model::<TopSongRow>()
+            .all(db)
+            .await
+            .map_err(|source| crate::Error::Database {
+                operation: "top_songs 查询",
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TopSong {
+                song: song_id(&row.ns, &row.song_value),
+                name: row.name,
+                plays: row.plays,
+                listen_ms: row.listen_ms,
+            })
+            .collect())
+    }
+
+    /// top 专辑(口味口径:按歌曲的 `songs.album_id` 归属聚合——「你听了哪张专辑的歌」,
+    /// 区别于 `top_contexts(Some("album"))` 的「你从谁的详情页起播」)。单曲(无专辑)
+    /// 与维表未覆盖的 `plays` 行(如贫投影从未富化)天然不进任何专辑的榜,不报错。
+    ///
+    /// # Params:
+    ///   - `range`: 时间窗口
+    ///   - `by`: 次数 / 时长口径
+    ///   - `options`: 有效播放阈值 + 榜长
+    ///
+    /// # Return:
+    ///   top 专辑列表
+    pub async fn top_albums(
+        &self,
+        range: Range<i64>,
+        by: TopBy,
+        options: &ReportOptions,
+    ) -> crate::Result<Vec<TopAlbum>> {
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let query = plays_in(range)
+            .select_only()
+            .columns([songs::Column::Ns, songs::Column::AlbumId])
+            .column_as(songs::Column::AlbumName.max(), ReportColumn::AlbumName)
+            .column_as(plays::Column::Id.count(), ReportColumn::Plays)
+            .column_as(
+                plays::Column::ListenMs.sum().if_null(0),
+                ReportColumn::ListenMs,
+            )
+            .join(JoinType::InnerJoin, song_dimension())
+            .filter(plays::Column::ListenMs.gte(options.min_listen_ms()))
+            .filter(songs::Column::AlbumId.is_not_null())
+            .group_by(songs::Column::Ns)
+            .group_by(songs::Column::AlbumId);
+        let rows = rank(query, by, options.top_limit())
+            .into_model::<TopAlbumRow>()
+            .all(db)
+            .await
+            .map_err(|source| crate::Error::Database {
+                operation: "top_albums 查询",
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TopAlbum {
+                album: AlbumId::new(SourceKind::from_name(&row.ns), row.album_id),
+                name: row.album_name,
+                plays: row.plays,
+                listen_ms: row.listen_ms,
+            })
+            .collect())
+    }
+
+    /// top 艺人(口味口径:按歌曲的 `song_artists` 归属聚合——「你听了谁的歌」,区别于
+    /// `top_contexts(Some("artist"))` 的「你从谁的详情页起播」)。合作曲对每位艺人各记
+    /// 一次全量 `listen_ms`,故各艺人时长之和会超过实际收听总时长,这是榜单口径的固有
+    /// 性质。维表未覆盖的 `plays` 行(如贫投影从未富化)天然不进任何艺人的榜,不报错。
+    ///
+    /// # Params:
+    ///   - `range`: 时间窗口
+    ///   - `by`: 次数 / 时长口径
+    ///   - `options`: 有效播放阈值 + 榜长
+    ///
+    /// # Return:
+    ///   top 艺人列表
+    pub async fn top_artists(
+        &self,
+        range: Range<i64>,
+        by: TopBy,
+        options: &ReportOptions,
+    ) -> crate::Result<Vec<TopArtist>> {
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let query = plays_in(range)
+            .select_only()
+            .columns([song_artists::Column::Ns, song_artists::Column::ArtistValue])
+            .column_as(
+                song_artists::Column::ArtistName.max(),
+                ReportColumn::ArtistName,
+            )
+            .column_as(plays::Column::Id.count(), ReportColumn::Plays)
+            .column_as(
+                plays::Column::ListenMs.sum().if_null(0),
+                ReportColumn::ListenMs,
+            )
+            .join(JoinType::InnerJoin, artist_dimension())
+            .filter(plays::Column::ListenMs.gte(options.min_listen_ms()))
+            .group_by(song_artists::Column::Ns)
+            .group_by(song_artists::Column::ArtistValue);
+        let rows = rank(query, by, options.top_limit())
+            .into_model::<TopArtistRow>()
+            .all(db)
+            .await
+            .map_err(|source| crate::Error::Database {
+                operation: "top_artists 查询",
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TopArtist {
+                artist: ArtistId::new(SourceKind::from_name(&row.ns), row.artist_value),
+                name: Some(row.artist_name),
+                plays: row.plays,
+                listen_ms: row.listen_ms,
+            })
+            .collect())
+    }
+
+    /// 单曲循环榜:`play_mode = 'repeat_one'` 的行按次数 top(反复循环的歌)。
+    ///
+    /// # Params:
+    ///   - `range`: 时间窗口
+    ///   - `limit`: 榜长
+    ///
+    /// # Return:
+    ///   单曲循环最多的歌(复用 [`TopSong`] 形状)
+    pub async fn top_repeat_songs(
+        &self,
+        range: Range<i64>,
+        limit: i64,
+    ) -> crate::Result<Vec<TopSong>> {
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let query = song_ranking(range).filter(plays::Column::PlayMode.eq(PlayMode::RepeatOne));
+        let rows = rank(query, TopBy::Plays, limit)
+            .into_model::<TopSongRow>()
+            .all(db)
+            .await
+            .map_err(|source| crate::Error::Database {
+                operation: "top_repeat_songs 查询",
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TopSong {
+                song: song_id(&row.ns, &row.song_value),
+                name: row.name,
+                plays: row.plays,
+                listen_ms: row.listen_ms,
+            })
+            .collect())
+    }
+
+    /// top 队列语境:最常从哪个搜索 / 歌单 / 专辑 / 艺人听(GROUP BY context_kind+ref)。
+    /// `min` 有效播放阈值与 `top_songs` / `top_artists` 同语义,统一「有效播放」定义。
+    ///
+    /// # Params:
+    ///   - `range`: 时间窗口
+    ///   - `kind`: 只看某类语境(`Some("album")` / `Some("artist")` 即从该专辑 / 艺人
+    ///     详情页起播的量;`None` 全类混排)
+    ///   - `min`: 有效播放阈值 ms(`listen_ms` 不足此值的行不计入)
+    ///   - `limit`: 榜单长度
+    ///
+    /// # Return:
+    ///   各语境的播放次数 + 收听 ms,按次数降序
+    pub async fn top_contexts(
+        &self,
+        range: Range<i64>,
+        kind: Option<&str>,
+        min: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<ContextSlice>> {
+        let Some(db) = self.pool() else {
+            return Ok(Vec::new());
+        };
+        let mut query = plays_in(range)
+            .select_only()
+            .column_as(plays::Column::ContextKind, ReportColumn::Kind)
+            .column_as(plays::Column::ContextRef, ReportColumn::Reference)
+            .column_as(plays::Column::Id.count(), ReportColumn::Plays)
+            .column_as(plays::Column::ListenMs.sum(), ReportColumn::ListenMs)
+            .column_as(plays::Column::ContextName.max(), ReportColumn::Name)
+            .filter(plays::Column::ListenMs.gte(min))
+            .group_by(plays::Column::ContextKind)
+            .group_by(plays::Column::ContextRef)
+            .order_by_desc(Expr::col(ReportColumn::Plays));
+        query = match kind {
+            Some(kind) => query
+                .filter(plays::Column::ContextKind.eq(kind))
+                .order_by_asc(plays::Column::ContextRef),
+            None => query.order_by_asc(plays::Column::ContextKind),
+        };
+        query
+            .limit(u64::try_from(limit).ok())
+            .into_model::<ContextSlice>()
+            .all(db)
+            .await
+            .map_err(|source| crate::Error::Database {
+                operation: "top_contexts 查询",
+                source,
+            })
+    }
+}
+
+/// 按歌曲身份聚合播放与歌曲维表。
+fn song_ranking(range: Range<i64>) -> Select<plays::Entity> {
+    plays_in(range)
+        .select_only()
+        .columns([plays::Column::Ns, plays::Column::SongValue])
+        .column(songs::Column::Name)
+        .column_as(plays::Column::Id.count(), ReportColumn::Plays)
+        .column_as(
+            plays::Column::ListenMs.sum().if_null(0),
+            ReportColumn::ListenMs,
+        )
+        .join(JoinType::LeftJoin, song_dimension())
+        .group_by(plays::Column::Ns)
+        .group_by(plays::Column::SongValue)
+}
+
+/// 指定次数或时长优先级；负数榜长沿用 SQLite 的不限条数语义。
+fn rank(mut query: Select<plays::Entity>, by: TopBy, limit: i64) -> Select<plays::Entity> {
+    let columns = match by {
+        TopBy::Plays => [ReportColumn::Plays, ReportColumn::ListenMs],
+        TopBy::Time => [ReportColumn::ListenMs, ReportColumn::Plays],
+    };
+    for column in columns {
+        query = query.order_by_desc(Expr::col(column));
+    }
+    query.limit(u64::try_from(limit).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::QueueContext;
+    use crate::vocab::FinishReason;
+
+    use super::super::test_support::{HOUR, T0, full_range, open_temp, options, play, seed};
+
+    #[tokio::test]
+    async fn top_songs_dual_metric_with_min_filter() -> color_eyre::Result<()> {
+        let (_d, store) = open_temp().await?;
+        seed(&store).await?;
+        // 有效阈值 30s:B(5s)被剔除;A(2 次/130s)、C(1 次/120s)。
+        let by_plays = store
+            .top_songs(full_range(), TopBy::Plays, &options(30_000))
+            .await?;
+        let plays_order = by_plays
+            .iter()
+            .map(|t| (t.song.value(), t.plays))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plays_order,
+            vec![("1", 2), ("3", 1)],
+            "B 被有效阈值剔除;A(2)>C(1)"
+        );
+
+        let by_time = store
+            .top_songs(full_range(), TopBy::Time, &options(30_000))
+            .await?;
+        let time_order = by_time
+            .iter()
+            .map(|t| (t.song.value(), t.listen_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            time_order,
+            vec![("1", 130_000), ("3", 120_000)],
+            "A 时长 130s 居首"
+        );
+        Ok(())
+    }
+
+    /// top_songs LEFT JOIN songs 维表出名;维表未覆盖的落 None(展示层回落 id)。
+    #[tokio::test]
+    async fn top_songs_joins_dim_names() -> color_eyre::Result<()> {
+        let (_d, store) = open_temp().await?;
+        seed(&store).await?;
+        store
+            .upsert_song(&mineral_test::with_name(mineral_test::song("1"), "栞"))
+            .await?;
+        let tops = store
+            .top_songs(full_range(), TopBy::Plays, &options(0))
+            .await?;
+        let names = tops
+            .iter()
+            .map(|t| (t.song.value(), t.name.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![("1", Some("栞")), ("3", None), ("2", None)],
+            "维表命中出名,未覆盖 None"
+        );
+        Ok(())
+    }
+
+    /// top_albums(口味口径):同专辑多首歌汇总播放次数 + listen_ms;单曲(无专辑)与
+    /// 没有 songs 维表覆盖的歌(未富化的贫投影)不进榜、不报错。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_albums_aggregates_songs_in_album() -> color_eyre::Result<()> {
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        // 专辑 A 两首歌(60s + 70s)。
+        store
+            .upsert_song(&mineral_test::with_album(mineral_test::song("1"), "A"))
+            .await?;
+        store
+            .upsert_song(&mineral_test::with_album(mineral_test::song("2"), "A"))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "1",
+                T0,
+                60_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "2",
+                T0 + HOUR,
+                70_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        // 歌 3:单曲(无专辑),不该进任何专辑的榜。
+        store.upsert_song(&mineral_test::song("3")).await?;
+        store
+            .record_play(&play(
+                "netease",
+                "3",
+                T0 + 2 * HOUR,
+                999_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        // 歌 4:无维表覆盖(未 upsert_song),不该进任何专辑的榜、不该报错。
+        store
+            .record_play(&play(
+                "netease",
+                "4",
+                T0 + 3 * HOUR,
+                999_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+
+        let opts = ReportOptions::builder()
+            .min_listen_ms(0)
+            .top_limit(10)
+            .build();
+        let albums = store.top_albums(0..i64::MAX, TopBy::Plays, &opts).await?;
+        assert_eq!(albums.len(), 1, "只有专辑 A,单曲与未覆盖的歌不贡献专辑");
+        let top = albums
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无专辑"))?;
+        assert_eq!(top.album, AlbumId::new(SourceKind::NETEASE, "A"));
+        assert_eq!(top.name.as_deref(), Some("A"));
+        assert_eq!(top.plays, 2);
+        assert_eq!(top.listen_ms, 60_000 + 70_000);
+        Ok(())
+    }
+
+    /// top_albums 双排序 + 有效阈值:低于阈值的行整体不计入任何专辑的次数与时长。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_albums_dual_metric_with_min_filter() -> color_eyre::Result<()> {
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        store
+            .upsert_song(&mineral_test::with_album(mineral_test::song("1"), "A"))
+            .await?;
+        store
+            .upsert_song(&mineral_test::with_album(mineral_test::song("2"), "B"))
+            .await?;
+        // A:一次 130s(有效)。B:一次 5s(低于 30s 阈值,应被剔除)。
+        store
+            .record_play(&play(
+                "netease",
+                "1",
+                T0,
+                130_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "2",
+                T0 + HOUR,
+                5_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+
+        let by_plays = store
+            .top_albums(0..i64::MAX, TopBy::Plays, &options(30_000))
+            .await?;
+        let plays_order = by_plays
+            .iter()
+            .map(|a| (a.album.value().to_owned(), a.plays))
+            .collect::<Vec<_>>();
+        assert_eq!(plays_order, vec![("A".to_owned(), 1)], "B 被有效阈值剔除");
+
+        let by_time = store
+            .top_albums(0..i64::MAX, TopBy::Time, &options(30_000))
+            .await?;
+        let time_order = by_time
+            .iter()
+            .map(|a| (a.album.value().to_owned(), a.listen_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(time_order, vec![("A".to_owned(), 130_000)]);
+        Ok(())
+    }
+
+    /// top_artists(口味口径):合作曲每位艺人各记一次全量播放 + 全量 listen_ms;
+    /// 没有 song_artists 覆盖的歌(维表未覆盖,如未富化的贫投影)不进榜、不报错。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_artists_credits_each_collaborator_in_full() -> color_eyre::Result<()> {
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        // 歌 1:单艺人 A,播两次(60s + 70s)。
+        store
+            .upsert_song(&mineral_test::with_artists(mineral_test::song("1"), &["A"]))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "1",
+                T0,
+                60_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "1",
+                T0 + HOUR,
+                70_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        // 歌 2:合作曲 A+B,播一次(100s)——A、B 各记一次全量。
+        store
+            .upsert_song(&mineral_test::with_artists(
+                mineral_test::song("2"),
+                &["A", "B"],
+            ))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "2",
+                T0 + 2 * HOUR,
+                100_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        // 歌 3:无艺人维表覆盖(未 upsert_song),不该进任何艺人的榜、不该报错。
+        store
+            .record_play(&play(
+                "netease",
+                "3",
+                T0 + 3 * HOUR,
+                999_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+
+        let opts = ReportOptions::builder()
+            .min_listen_ms(0)
+            .top_limit(10)
+            .build();
+        let artists = store.top_artists(0..i64::MAX, TopBy::Plays, &opts).await?;
+        assert_eq!(artists.len(), 2, "只有 A、B,歌 3 不贡献任何艺人");
+        let by_value = |v: &str| {
+            artists
+                .iter()
+                .find(|a| a.artist.value() == v)
+                .ok_or_else(|| color_eyre::eyre::eyre!("missing artist {v}"))
+        };
+        let a = by_value("A")?;
+        assert_eq!(a.plays, 3, "歌1×2 + 歌2×1");
+        assert_eq!(a.listen_ms, 60_000 + 70_000 + 100_000, "各记全量,非折半");
+        let b = by_value("B")?;
+        assert_eq!(b.plays, 1);
+        assert_eq!(b.listen_ms, 100_000, "合作曲对 B 同样记全量,不因合作打折");
+        Ok(())
+    }
+
+    /// top_artists 双排序 + 有效阈值:低于阈值的行整体不计入任何艺人的次数与时长。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_artists_dual_metric_with_min_filter() -> color_eyre::Result<()> {
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        store
+            .upsert_song(&mineral_test::with_artists(mineral_test::song("1"), &["A"]))
+            .await?;
+        store
+            .upsert_song(&mineral_test::with_artists(mineral_test::song("2"), &["B"]))
+            .await?;
+        // A:一次 130s(有效)。B:一次 5s(低于 30s 阈值,应被剔除)。
+        store
+            .record_play(&play(
+                "netease",
+                "1",
+                T0,
+                130_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+        store
+            .record_play(&play(
+                "netease",
+                "2",
+                T0 + HOUR,
+                5_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            ))
+            .await?;
+
+        let by_plays = store
+            .top_artists(0..i64::MAX, TopBy::Plays, &options(30_000))
+            .await?;
+        let plays_order = by_plays
+            .iter()
+            .map(|a| (a.artist.value().to_owned(), a.plays))
+            .collect::<Vec<_>>();
+        assert_eq!(plays_order, vec![("A".to_owned(), 1)], "B 被有效阈值剔除");
+
+        let by_time = store
+            .top_artists(0..i64::MAX, TopBy::Time, &options(30_000))
+            .await?;
+        let time_order = by_time
+            .iter()
+            .map(|a| (a.artist.value().to_owned(), a.listen_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(time_order, vec![("A".to_owned(), 130_000)]);
+        Ok(())
+    }
+
+    /// top_repeat_songs:只数 `play_mode='repeat_one'` 的行,按次数 top(sequential 不计)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_repeat_songs_filters_repeat_one() -> color_eyre::Result<()> {
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        for (value, at, mode) in [
+            ("loop", T0, crate::PlayMode::RepeatOne),
+            ("loop", T0 + HOUR, crate::PlayMode::RepeatOne),
+            ("seq", T0 + 2 * HOUR, crate::PlayMode::RepeatOne),
+            ("seq", T0 + 3 * HOUR, crate::PlayMode::Sequential),
+        ] {
+            let mut r = play(
+                "netease",
+                value,
+                at,
+                60_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            );
+            r.play_mode = mode;
+            store.record_play(&r).await?;
+        }
+        let repeats = store.top_repeat_songs(0..i64::MAX, 10).await?;
+        assert_eq!(repeats.len(), 2, "两首曾单曲循环");
+        let top = repeats
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无循环歌"))?;
+        assert_eq!(top.song, song_id("netease", "loop"));
+        assert_eq!(top.plays, 2, "loop 循环 2 次");
+        let seq = repeats
+            .iter()
+            .find(|t| t.song == song_id("netease", "seq"))
+            .ok_or_else(|| color_eyre::eyre::eyre!("无 seq"))?;
+        assert_eq!(seq.plays, 1, "seq 仅 1 次单曲循环(sequential 那次不计)");
+        Ok(())
+    }
+
+    /// top_contexts:按语境分组计次(同歌单两次 > 搜索一次),context_ref 落 qualified id。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_contexts_groups_by_context() -> color_eyre::Result<()> {
+        use mineral_model::PlaylistId;
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        let pl = QueueContext::Playlist {
+            id: PlaylistId::new(SourceKind::NETEASE, "7"),
+            name: Some("收藏夹".to_owned()),
+        };
+        for (value, at, ctx) in [
+            ("1", T0, pl.clone()),
+            ("2", T0 + HOUR, pl.clone()),
+            (
+                "3",
+                T0 + 2 * HOUR,
+                QueueContext::Search {
+                    query: Some("李志".to_owned()),
+                },
+            ),
+        ] {
+            let mut r = play(
+                "netease",
+                value,
+                at,
+                60_000,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            );
+            r.context = ctx;
+            store.record_play(&r).await?;
+        }
+        let contexts = store.top_contexts(0..i64::MAX, None, 0, 10).await?;
+        let first = contexts
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无语境"))?;
+        assert_eq!(first.kind, "playlist");
+        assert_eq!(first.reference.as_deref(), Some("netease:7"));
+        assert_eq!(first.plays, 2);
+        assert_eq!(first.listen_ms, 120_000);
+        assert_eq!(first.name.as_deref(), Some("收藏夹"), "歌单名快照直出");
+        // kind 过滤 = top 专辑 / 艺人的 context 版:只留 search 语境那一条。
+        let searches = store
+            .top_contexts(0..i64::MAX, Some("search"), 0, 10)
+            .await?;
+        assert_eq!(searches.len(), 1, "只 search 类");
+        let only = searches
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无 search 语境"))?;
+        assert_eq!(only.kind, "search");
+        assert_eq!(only.reference.as_deref(), Some("李志"));
+        Ok(())
+    }
+
+    /// top_contexts 有效阈值:低于 `min` 的行整条不进任何语境的次数与时长(kind 过滤
+    /// 与全类混排两条查询路径都要受阈值约束)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_contexts_respects_min_listen_ms() -> color_eyre::Result<()> {
+        use mineral_model::PlaylistId;
+        let (_dir, store) = open_temp().await?;
+        let sid = store
+            .open_session(T0)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("session"))?;
+        let pl = QueueContext::Playlist {
+            id: PlaylistId::new(SourceKind::NETEASE, "7"),
+            name: Some("收藏夹".to_owned()),
+        };
+        // 一次有效播放(130s)+ 一次低于阈值(5s),同一歌单语境。
+        for (value, at, listen_ms) in [("1", T0, 130_000), ("2", T0 + HOUR, 5_000)] {
+            let mut r = play(
+                "netease",
+                value,
+                at,
+                listen_ms,
+                FinishReason::Eof,
+                None,
+                None,
+                sid,
+            );
+            r.context = pl.clone();
+            store.record_play(&r).await?;
+        }
+        let filtered = store
+            .top_contexts(0..i64::MAX, Some("playlist"), 30_000, 10)
+            .await?;
+        let only = filtered
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无语境"))?;
+        assert_eq!(only.plays, 1, "5s 那次被阈值剔除,只剩 130s 那次");
+        assert_eq!(only.listen_ms, 130_000);
+
+        let unfiltered = store
+            .top_contexts(0..i64::MAX, Some("playlist"), 0, 10)
+            .await?;
+        let both = unfiltered
+            .first()
+            .ok_or_else(|| color_eyre::eyre::eyre!("无语境"))?;
+        assert_eq!(both.plays, 2, "阈值为 0 时两次都计入");
+        Ok(())
+    }
+}

@@ -10,8 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mineral_channel_core::{Error as ChannelError, MusicChannel};
-use mineral_model::{MediaUrl, Song};
+use mineral_channel_core::{Error as ChannelError, MusicChannel, finish_fetch};
+use mineral_model::{CachePolicy, MediaUrl, Song};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
@@ -97,8 +97,10 @@ async fn fetch_album(
     if let Some(hit) = cache.lock().get(&key) {
         return hit.clone();
     }
-    let result = match channel.album_detail(&album_ref.id).await {
-        Ok(album) => Some(AlbumTags {
+    let result = match finish_fetch(channel.album_detail(&album_ref.id, CachePolicy::UseCache))
+        .await
+    {
+        Ok(Some(album)) => Some(AlbumTags {
             artists: album
                 .artists
                 .iter()
@@ -107,6 +109,7 @@ async fn fetch_album(
             year: publish_year(album.publish_time_ms).and_then(|y| u32::try_from(y).ok()),
             label: album.company.clone(),
         }),
+        Ok(None) => None,
         Err(e) => {
             mineral_log::warn!(target: "tagging", song_id = song.id.as_str(), error = mineral_log::chain(&e), "拉专辑详情失败,专辑字段缺省");
             None
@@ -168,12 +171,10 @@ async fn fetch_cover(http: Option<&reqwest::Client>, song: &Song) -> Option<Vec<
 ///
 /// # Return:
 ///   公历年;未知 / 溢出为 `None`。
-fn publish_year(ms: i64) -> Option<i32> {
-    if ms <= 0 {
-        return None;
-    }
+fn publish_year(ms: Option<i64>) -> Option<i32> {
+    let ms = ms?;
     let beijing = time::UtcOffset::from_hms(8, 0, 0).ok()?;
-    let dt = time::OffsetDateTime::from_unix_timestamp(ms / 1000).ok()?;
+    let dt = time::OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)).ok()?;
     Some(dt.to_offset(beijing).year())
 }
 
@@ -228,7 +229,7 @@ mod tests {
                 },
             ])
             .company(Some("杰威尔".to_owned()))
-            .publish_time_ms(1_059_379_200_000) // 2003-07-31 北京
+            .publish_time_ms(Some(1_059_379_200_000)) // 2003-07-31 北京
             .build()
     }
 
@@ -319,10 +320,10 @@ mod tests {
 
     #[test]
     fn publish_year_uses_beijing_offset() {
-        assert_eq!(publish_year(1_059_379_200_000), Some(2003));
+        assert_eq!(publish_year(Some(1_059_379_200_000)), Some(2003));
         // 2020-01-01 00:00 北京(= 2019-12-31 16:00 UTC)→ 2020;UTC 读会错成 2019。
-        assert_eq!(publish_year(1_577_808_000_000), Some(2020));
-        assert_eq!(publish_year(0), None);
-        assert_eq!(publish_year(-1), None);
+        assert_eq!(publish_year(Some(1_577_808_000_000)), Some(2020));
+        assert_eq!(publish_year(None), None);
+        assert_eq!(publish_year(Some(-1)), Some(1970));
     }
 }

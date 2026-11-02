@@ -1,0 +1,154 @@
+//! 网易云登录凭证的本地持久化。
+//!
+//! CLI 二维码登录成功后,把 `MUSIC_U` cookie 与登录用户 `userId` 写到
+//! `<data_dir>/netease.json`;TUI 启动时再用 [`load_stored`] 读回来,
+//! 并据此构造 [`crate::NeteaseChannel::with_credential`]。
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use mineral_model::UserId;
+use serde::{Deserialize, Serialize};
+
+use crate::Error;
+
+/// 凭证文件名,放在 `mineral_paths::data_dir()` 下。
+pub const CREDENTIAL_FILE: &str = "netease.json";
+
+/// 序列化到磁盘的网易云登录凭证。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredNeteaseAuth {
+    /// 网易云核心登录 cookie(`MUSIC_U` 字段值,不含 `MUSIC_U=` 前缀)。
+    pub music_u: String,
+
+    /// 登录用户的 `userId`,拉 `user_playlists` 时需要。
+    pub user_id: UserId,
+}
+
+/// 解析得到凭证文件的绝对路径(可能尚不存在)。
+///
+/// # Return:
+///   `<data_dir>/netease.json` 的绝对路径。本函数不创建目录、不做存在性检查。
+pub fn credential_path() -> crate::Result<PathBuf> {
+    Ok(mineral_paths::data_dir()?.join(CREDENTIAL_FILE))
+}
+
+/// 把凭证写到磁盘,父目录不存在时自动创建。
+///
+/// # Params:
+///   - `auth`: 待持久化的凭证
+///
+/// # Return:
+///   成功返回 `Ok(())`;父目录创建失败、序列化失败或写盘失败时返回 `Err`。
+pub fn save(auth: &StoredNeteaseAuth) -> crate::Result<PathBuf> {
+    let path = credential_path()?;
+    write_to(&path, auth)?;
+    mineral_log::info!(target: "credential", path = %path.display(), uid = auth.user_id.as_str(), "credential saved");
+    Ok(path)
+}
+
+/// 从磁盘加载凭证。
+///
+/// # Return:
+///   - `Ok(Some(auth))`: 文件存在且解析成功
+///   - `Ok(None)`: 文件不存在(尚未登录,正常状态)
+///   - `Err(_)`: 文件存在但读/解析失败(磁盘损坏、JSON schema 漂移等)
+pub fn load_stored() -> crate::Result<Option<StoredNeteaseAuth>> {
+    let path = credential_path()?;
+    let loaded = read_from(&path)?;
+    match &loaded {
+        Some(auth) => {
+            mineral_log::debug!(target: "credential", uid = auth.user_id.as_str(), "stored credential loaded");
+        }
+        None => mineral_log::debug!(target: "credential", "no stored credential (not logged in)"),
+    }
+    Ok(loaded)
+}
+
+/// 把 `auth` 序列化成 JSON 写到 `path`,父目录不存在时自动创建。
+fn write_to(path: &Path, auth: &StoredNeteaseAuth) -> crate::Result<()> {
+    let parent = path.parent().ok_or_else(|| Error::InvalidCredentialPath {
+        path: path.to_path_buf(),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| Error::File {
+        operation: "create credential directory",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let json = serde_json::to_string_pretty(auth)?;
+    fs::write(path, json).map_err(|source| Error::File {
+        operation: "write credential",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// 从 `path` 读凭证;文件不存在 → `Ok(None)`,其他 IO/解析失败 → `Err`。
+fn read_from(path: &Path) -> crate::Result<Option<StoredNeteaseAuth>> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let auth: StoredNeteaseAuth =
+                serde_json::from_str(&text).map_err(|source| Error::Parse {
+                    context: path.display().to_string(),
+                    source: Box::new(source),
+                })?;
+            Ok(Some(auth))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::File {
+            operation: "read credential",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoredNeteaseAuth, read_from, write_to};
+    use mineral_model::{SourceKind, UserId};
+
+    #[test]
+    fn round_trip_via_disk() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("netease.json");
+        let auth = StoredNeteaseAuth {
+            music_u: String::from("opaque-token"),
+            user_id: UserId::new(SourceKind::NETEASE, "12345"),
+        };
+
+        write_to(&path, &auth)?;
+        let loaded = read_from(&path)?.expect("file exists after write");
+
+        assert_eq!(loaded.music_u, auth.music_u);
+        assert_eq!(loaded.user_id, auth.user_id);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_file_returns_none() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("does-not-exist.json");
+        assert!(read_from(&path)?.is_none());
+        Ok(())
+    }
+
+    /// 钉住 ID 结构化后磁盘上的确切 schema:`user_id` 是 `{namespace,value}`,
+    /// 命中内置 `NETEASE` 常量。future serde 漂移(改回 transparent / 改字段名)会被抓。
+    #[test]
+    fn parses_new_format_credential() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("netease.json");
+        std::fs::write(
+            &path,
+            r#"{"music_u":"opaque-token","user_id":{"namespace":"netease","value":"349758847"}}"#,
+        )?;
+
+        let auth = read_from(&path)?.expect("new-format credential parses");
+        assert_eq!(auth.music_u, "opaque-token");
+        assert_eq!(auth.user_id, UserId::new(SourceKind::NETEASE, "349758847"));
+        assert_eq!(auth.user_id.namespace(), SourceKind::NETEASE);
+        Ok(())
+    }
+}

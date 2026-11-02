@@ -1,0 +1,20 @@
+//! `BilibiliChannel` 的构造参数([`BilibiliConfig`])。
+
+/// `BilibiliChannel` 的构造参数。私有字段 + builder 构造 + getter 读取。
+///
+/// **所有字段必填,本类型不携带默认值**:默认值的唯一来源是
+/// `crates/mineral-server/src/config/lua/daemon-default.lua` 的 `sources.bilibili` 段,
+/// 由消费侧(`mineral` 启动链 / CLI)映射传入,
+/// 避免两处默认漂移。
+#[non_exhaustive]
+#[derive(Clone, Debug, typed_builder::TypedBuilder, derive_getters::Getters)]
+pub struct BilibiliConfig {
+    /// 最大并发连接数(`0` 表示不限)。
+    max_connections: usize,
+
+    /// 代理地址(`None` = 不走代理),例如 `socks5://127.0.0.1:1080`。
+    proxy: Option<String>,
+
+    /// 单次请求超时(秒)。
+    timeout_secs: u64,
+}

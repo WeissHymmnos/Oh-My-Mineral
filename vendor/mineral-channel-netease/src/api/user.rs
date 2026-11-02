@@ -1,0 +1,65 @@
+//! 当前登录用户的身份与喜欢歌曲端点。
+//!
+//! `account_uid` 在二维码登录成功后补齐持久化凭证中的用户身份;
+//! `liked_song_ids` 返回该身份的远端喜欢歌曲集合。
+
+use mineral_model::{SongId, SourceKind, UserId};
+use rustc_hash::FxHashSet;
+use serde_json::json;
+
+use crate::{Error, Result};
+
+use crate::transport::client::{RequestSpec, Transport};
+use crate::transport::headers::UaKind;
+use crate::transport::url::Crypto;
+use crate::wire::user::LikeListResp;
+
+/// 拉取当前登录用户的 `userId`。
+///
+/// # Params:
+///   - `transport`: 已注入登录 cookie 的 [`Transport`]
+///
+/// # Return:
+///   登录用户的 [`UserId`];未登录或 cookie 失效时返回 `Err`。
+pub async fn account_uid(transport: &Transport) -> Result<UserId> {
+    let v = transport
+        .request(RequestSpec {
+            path: "/api/nuser/account/get",
+            crypto: Crypto::Weapi,
+            params: serde_json::Map::new(),
+            ua: UaKind::Pc,
+        })
+        .await?;
+    let id = v
+        .get("account")
+        .and_then(|x| x.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::InvalidData {
+            field: "account.id",
+        })?;
+    Ok(UserId::new(SourceKind::NETEASE, id.to_string()))
+}
+
+/// 当前用户喜欢(♥)的歌曲 ID 集合。
+///
+/// 走 `/weapi/song/like/get`(`/likelist` 别名),crypto = weapi。
+/// 响应 `{ids: [number, ...]}`,数字转成 [`SongId`] 字符串。
+pub async fn liked_song_ids(transport: &Transport, uid: &UserId) -> Result<FxHashSet<SongId>> {
+    let mut p = serde_json::Map::new();
+    p.insert("uid".into(), json!(uid.as_str()));
+
+    let v = transport
+        .request(RequestSpec {
+            path: "/weapi/song/like/get",
+            crypto: Crypto::Weapi,
+            params: p,
+            ua: UaKind::Pc,
+        })
+        .await?;
+    let resp: LikeListResp = crate::wire::de::from_value(v)?;
+    Ok(resp
+        .ids
+        .into_iter()
+        .map(|n| SongId::new(SourceKind::NETEASE, n.to_string()))
+        .collect())
+}

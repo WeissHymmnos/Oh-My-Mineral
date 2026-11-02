@@ -9,6 +9,7 @@ return {
     backend = "auto",
     playback_quality = "exhigh",
     engine_tick_ms = 20,
+    pcm_buffer_ms = 200,
     prefetch_bytes = 256 * KB,
     tap_capacity = 8192,
     envelope = {
@@ -38,6 +39,21 @@ return {
     tagging_workers = 4,
   },
   sources = {
+    am = {
+      timeout_secs = 100,
+      proxy = false,
+      developer_token_cache_ttl_days = 30,
+      lyrics_translation_language = "zh-hans-cn",
+      lyrics_romanization_script = "ja-Latn",
+      album_cache = {
+        ttl_days = 30,
+        ttl_jitter_days = 7,
+      },
+      device_file = nil, -- nil 使用内置身份；填写路径则只使用指定 WVD。
+      media_concurrency = 16,
+      startup_buffer_secs = 10,
+      fragment_header_prefetch_bytes = 16 * KB,
+    },
     ["local"] = {
       roots = {},
     },
@@ -73,7 +89,7 @@ return {
   queue = {
     transforms = {},
   },
-  gapless_prefetch_ms = 10000,
+  gapless_prefetch_ms = 20000,
   prev_restart_threshold_ms = 3000,
   player_tick_ms = 20,
   session_save_secs = 15,

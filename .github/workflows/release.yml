@@ -26,16 +26,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config qt6-base-dev libgtk-4-dev libasound2-dev libdbus-1-dev cpio xz-utils binutils
-      - name: Fetch or Build Mineral Daemon
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          if curl -fsSL "https://github.com/WeissHymmnos/Oh-My-Mineral/releases/download/v0.1.0/mineral-gui-0.1.0-linux-x86_64.tar.gz" -o /tmp/mineral-linux.tar.gz; then
-            tar -xzf /tmp/mineral-linux.tar.gz -C /tmp
-            cp /tmp/mineral-gui-0.1.0-linux-x86_64/mineral "$HOME/.cargo/bin/mineral"
-            chmod +x "$HOME/.cargo/bin/mineral"
-          else
-            cargo install mineral --version 0.5.10 --locked || cargo install mineral --version 0.5.10
-          fi
       - name: Build & Package (.rpm, .deb, .tar.gz)
         run: |
           rm -f .cargo/config.toml
@@ -61,8 +51,6 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix qt@6)/lib/pkgconfig" >> $GITHUB_ENV
           echo "QT_ROOT_DIR=$(brew --prefix qt@6)" >> $GITHUB_ENV
           echo "$(brew --prefix qt@6)/bin" >> $GITHUB_PATH
-      - name: Install Mineral Daemon
-        run: cargo install mineral --version 0.5.10 --locked || cargo install mineral --version 0.5.10
       - name: Build & Package macOS .dmg
         run: |
           rm -f .cargo/config.toml

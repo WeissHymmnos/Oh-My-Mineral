@@ -5,14 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mineral_channel_core::{ChannelCaps, Error, MusicChannel, Page, PageResult};
-use mineral_model::{
-    Album, AlbumId, Artist, Lyrics, PlaybackMediaInfo, Playlist, PlaylistId, Song, SongId,
-    SourceKind,
-};
+use mineral_channel_core::{ChannelCaps, CollectionStream, Error, MusicChannel, fresh_collection};
+use mineral_model::CachePolicy;
+use mineral_model::{Artist, Lyrics, PlaybackMediaInfo, Playlist, Song, SongId, SourceKind};
 use mineral_playback::{
     DirectMedia, MediaReader, OpenOptions, OpenedMedia, PlaybackProvider, PlaybackRegistry,
-    PlaybackRequest, PreparedPlayback, SeekSupport,
+    PlaybackRequest, PreparedPlayback,
 };
 use parking_lot::Mutex;
 
@@ -131,7 +129,6 @@ impl PreparedPlayback for TestPreparedPlayback {
         let reader: Box<dyn MediaReader> = Box::new(Cursor::new(bytes));
         Ok(OpenedMedia::new(
             reader,
-            SeekSupport::RandomAccess,
             byte_len,
             self.info,
             None,
@@ -181,43 +178,11 @@ impl MusicChannel for RecordingChannel {
             .build()
     }
 
-    async fn search_songs(
+    async fn songs_detail(
         &self,
-        _query: &str,
-        _page: Page,
-    ) -> mineral_channel_core::Result<PageResult<Song>> {
-        Err(Error::NotSupported)
-    }
-
-    async fn search_albums(
-        &self,
-        _query: &str,
-        _page: Page,
-    ) -> mineral_channel_core::Result<PageResult<Album>> {
-        Err(Error::NotSupported)
-    }
-
-    async fn search_playlists(
-        &self,
-        _query: &str,
-        _page: Page,
-    ) -> mineral_channel_core::Result<PageResult<Playlist>> {
-        Err(Error::NotSupported)
-    }
-
-    async fn songs_detail(&self, _ids: &[SongId]) -> mineral_channel_core::Result<Vec<Song>> {
-        Err(Error::NotSupported)
-    }
-
-    async fn album_detail(&self, _id: &AlbumId) -> mineral_channel_core::Result<Album> {
-        Err(Error::NotSupported)
-    }
-
-    async fn playlist_detail(
-        &self,
-        _id: &PlaylistId,
-        _load: mineral_channel_core::PlaylistLoad,
-    ) -> mineral_channel_core::Result<mineral_channel_core::PlaylistDetail> {
+        _ids: &[SongId],
+        _cache: CachePolicy,
+    ) -> mineral_channel_core::Result<Vec<Song>> {
         Err(Error::NotSupported)
     }
 
@@ -246,7 +211,7 @@ impl MusicChannel for RecordingChannel {
         self.liked_ids.clone().ok_or(Error::NotSupported)
     }
 
-    async fn my_playlists(&self) -> mineral_channel_core::Result<Vec<Playlist>> {
-        self.playlists.clone().ok_or(Error::NotSupported)
+    fn my_playlists(&self, _cache: CachePolicy) -> CollectionStream<'_, Playlist> {
+        fresh_collection(async { self.playlists.clone().ok_or(Error::NotSupported) })
     }
 }

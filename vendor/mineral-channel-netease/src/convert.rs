@@ -1,0 +1,715 @@
+//! 网易原生 DTO → `mineral_model` 类型的转换 helper。
+
+use mineral_channel_core::PageResult;
+use mineral_model::{
+    Album, AlbumId, AlbumRef, AlbumTrack, Artist, ArtistId, ArtistRef, AudioFormat,
+    CollectionIndex, MediaUrl, PlaybackMediaInfo, Playlist, PlaylistEntry, PlaylistId, Song,
+    SongId, SourceKind,
+};
+use mineral_playback::DirectMedia;
+use rustc_hash::FxHashMap;
+use url::Url;
+
+use crate::Result;
+use crate::wire::album::SavedAlbum;
+use crate::wire::artist::{ArtistAlbum, ArtistAlbumsResult, ArtistDetailResult};
+use crate::wire::playlist::{PlaylistInfo, TrackId};
+use crate::wire::search::{AlbumDetailResult, SearchAlbum, SearchArtist, SearchPlaylist};
+use crate::wire::song::{AlbumSong, Artist as WireArtist, SongUrl};
+
+pub(crate) enum WebPage {
+    Song(i64),
+
+    Album(i64),
+
+    Artist(i64),
+
+    Playlist(i64),
+}
+
+impl WebPage {
+    pub(crate) fn into_url(self) -> Result<Url> {
+        let (path, id) = match self {
+            Self::Song(id) => ("song", id),
+            Self::Album(id) => ("album", id),
+            Self::Artist(id) => ("artist", id),
+            Self::Playlist(id) => ("playlist", id),
+        };
+        let mut url = Url::parse("https://music.163.com/")?;
+        url.set_path(path);
+        url.query_pairs_mut().append_pair("id", &id.to_string());
+        Ok(url)
+    }
+}
+
+/// 把网易 JSON 里的字符串字段(永远是 http(s) URL)转成 `MediaUrl::Remote`。
+///
+/// 解析失败或空字符串返回 `None`,让 `Option<MediaUrl>` 字段保持空。
+pub fn parse_remote(s: &str) -> Option<MediaUrl> {
+    if s.is_empty() {
+        return None;
+    }
+    MediaUrl::remote(s).ok()
+}
+
+/// `Option<&str>` 版的便利包装。
+pub fn parse_remote_opt(s: Option<&str>) -> Option<MediaUrl> {
+    s.and_then(parse_remote)
+}
+
+/// album 的 artist 列表 → `Vec<ArtistRef>`:优先全列表 `artists`,为空时退回主 artist
+/// `primary`(部分端点只给单个 `artist`)。
+pub(crate) fn album_artist_refs(
+    artists: Vec<WireArtist>,
+    primary: Option<WireArtist>,
+) -> Vec<ArtistRef> {
+    let list = if artists.is_empty() {
+        primary.into_iter().collect::<Vec<WireArtist>>()
+    } else {
+        artists
+    };
+    list.into_iter()
+        .map(|a| ArtistRef {
+            id: ArtistId::new(SourceKind::NETEASE, a.id.to_string()),
+            name: a.name,
+        })
+        .collect()
+}
+
+/// 专辑元信息 DTO + 已解析曲目 → 统一 [`Album`]。
+///
+/// 搜索与详情共用:搜索结果只有元信息(`songs` 传空),详情端点元信息 + 曲目都全。
+pub(crate) fn album_dto_to_model(a: SearchAlbum, tracks: Vec<AlbumTrack>) -> Result<Album> {
+    Ok(Album::builder()
+        .web_url(Some(WebPage::Album(a.id).into_url()?))
+        .id(AlbumId::new(SourceKind::NETEASE, a.id.to_string()))
+        .name(a.name)
+        .artists(album_artist_refs(a.artists, a.artist))
+        .description(a.description)
+        .company(a.company)
+        .publish_time_ms(a.publish_time)
+        .track_count(Some(a.size))
+        .cover_url(a.pic_url.as_deref().and_then(parse_remote))
+        .tracks(tracks)
+        .build())
+}
+
+/// 账号收藏列表保留全部艺人和未知曲目数，不推导曲目或收藏时间。
+pub(crate) fn saved_album_to_model(album: SavedAlbum) -> Result<Album> {
+    Ok(Album::builder()
+        .web_url(Some(WebPage::Album(album.id).into_url()?))
+        .id(AlbumId::new(SourceKind::NETEASE, album.id.to_string()))
+        .name(album.name)
+        .artists(album_artist_refs(album.artists, None))
+        .track_count(album.size)
+        .cover_url(parse_remote_opt(album.pic_url.as_deref()))
+        .build())
+}
+
+/// 专辑详情响应(元信息 + 曲目)→ 统一 [`Album`]。
+pub(crate) fn album_detail_to_model(r: AlbumDetailResult) -> Result<Album> {
+    let songs = r
+        .songs
+        .into_iter()
+        .map(album_song_to_model)
+        .collect::<Result<Vec<Song>>>()?;
+    album_dto_to_model(r.album, AlbumTrack::enumerate(songs))
+}
+
+/// 歌单元信息 DTO + 已解析曲目 → 统一 [`Playlist`]。
+///
+/// 详情与用户列表共用:详情端点元信息 + 曲目都有(`songs` 传全拉/缓存重建的曲目);
+/// 用户列表项只有元信息(`songs` 传空)。
+pub(crate) fn playlist_info_to_model(
+    info: &PlaylistInfo,
+    entries: Vec<PlaylistEntry>,
+) -> Result<Playlist> {
+    Ok(Playlist::builder()
+        .web_url(Some(WebPage::Playlist(info.id).into_url()?))
+        .id(PlaylistId::new(SourceKind::NETEASE, info.id.to_string()))
+        .name(info.name.clone())
+        .description(info.description.clone())
+        .cover_url(info.cover_img_url.as_deref().and_then(parse_remote))
+        .track_count(info.track_count)
+        .play_count(info.play_count)
+        .subscriber_count(info.subscribed_count)
+        .entries(entries)
+        .build())
+}
+
+/// 以 authoritative `trackIds[]` array coordinate join Song metadata，保留缺 metadata 的 gap。
+///
+/// Metadata Vec 的自身顺序不参与 Playlist order；duplicate SongId 可在不同 index 生成多个
+/// relation occurrence。
+///
+/// # Params:
+///   - `track_ids`: 远端 canonical playlist order
+///   - `songs`: 远端或缓存重建得到的 Song metadata
+///
+/// # Return:
+///   成功 join 的 PlaylistEntry；missing metadata 只跳过该 entry，不重编号后续 index。
+pub(crate) fn playlist_entries_from_order(
+    track_ids: &[TrackId],
+    songs: Vec<Song>,
+) -> Vec<PlaylistEntry> {
+    let by_id = songs
+        .into_iter()
+        .map(|song| (song.id.clone(), song))
+        .collect::<FxHashMap<SongId, Song>>();
+    track_ids
+        .iter()
+        .zip(0_u64..)
+        .filter_map(|(track_id, index)| {
+            let id = SongId::new(SourceKind::NETEASE, track_id.id.to_string());
+            by_id.get(&id).cloned().map(|song| {
+                PlaylistEntry::builder()
+                    .index(CollectionIndex::new(index))
+                    .song(song)
+                    .build()
+            })
+        })
+        .collect()
+}
+
+/// 专辑/歌单/artist 详情里的 [`AlbumSong`](ar/al/dt 字段风格)→ 统一 [`Song`]。
+pub(crate) fn album_song_to_model(s: AlbumSong) -> Result<Song> {
+    Ok(Song::builder()
+        .web_url(Some(WebPage::Song(s.id).into_url()?))
+        .id(SongId::new(SourceKind::NETEASE, s.id.to_string()))
+        .name(s.name)
+        // 别名优先取译名(tns),译名无效再退网易「别名」(alia:副标题/罗马音/出处)——tns 更有
+        // 意义,alia 常是出处说明。取首个**非空**项;空串不当值(避免渲染裸 ` ()` + 被 upsert 钉死)。
+        .alias(
+            s.tns
+                .into_iter()
+                .chain(s.alia)
+                .find(|t| !t.trim().is_empty()),
+        )
+        .artists(
+            s.ar.into_iter()
+                .map(|a| ArtistRef {
+                    id: ArtistId::new(SourceKind::NETEASE, a.id.to_string()),
+                    name: a.name,
+                })
+                .collect(),
+        )
+        .album(Some(AlbumRef {
+            id: AlbumId::new(SourceKind::NETEASE, s.al.id.to_string()),
+            name: s.al.name,
+        }))
+        // 接口用 dt=0 表示时长未知,在 channel 边界转成 None,0 哨兵不进模型。
+        .duration_ms((s.dt > 0).then_some(s.dt))
+        .cover_url(s.al.pic_url.as_deref().and_then(parse_remote))
+        .unavailable(s.privilege.as_ref().is_some_and(|p| p.st < 0))
+        .build())
+}
+
+/// 搜索结果 artist DTO → 统一 [`Artist`]。
+///
+/// 搜索只给元信息 + 粉丝数(`fansSize`),不含简介/热门曲——简介与曲目按需走 `artist_detail`。
+pub(crate) fn search_artist_to_model(a: SearchArtist) -> Result<Artist> {
+    Ok(Artist::builder()
+        .web_url(Some(WebPage::Artist(a.id).into_url()?))
+        .id(ArtistId::new(SourceKind::NETEASE, a.id.to_string()))
+        .name(a.name)
+        .follower_count(a.fans_size)
+        .avatar_url(parse_remote_opt(a.pic_url.as_deref()))
+        .build())
+}
+
+/// 搜索结果歌单 DTO → 统一 [`Playlist`](只有元信息,曲目按需走 `playlist_detail`)。
+pub(crate) fn search_playlist_to_model(p: SearchPlaylist) -> Result<Playlist> {
+    Ok(Playlist::builder()
+        .web_url(Some(WebPage::Playlist(p.id).into_url()?))
+        .id(PlaylistId::new(SourceKind::NETEASE, p.id.to_string()))
+        .name(p.name)
+        .description(p.description.unwrap_or_default())
+        .cover_url(p.cover_img_url.as_deref().and_then(parse_remote))
+        .track_count(p.track_count)
+        .play_count(p.play_count)
+        .subscriber_count(p.book_count)
+        .build())
+}
+
+/// artist 详情响应 + 粉丝数 → 统一 [`Artist`]。
+///
+/// `fans` 来自 `/api/artist/follow/count/get`——详情端点顶层不带粉丝数,由 channel 并发补打
+/// 后传入(补打失败为 `None`)。`albumSize`/`musicSize` 是详情端点顶层独家给的名下专辑/歌曲计数。
+pub(crate) fn artist_detail_to_model(r: ArtistDetailResult, fans: Option<u64>) -> Result<Artist> {
+    Ok(Artist::builder()
+        .web_url(Some(WebPage::Artist(r.artist.id).into_url()?))
+        .id(ArtistId::new(SourceKind::NETEASE, r.artist.id.to_string()))
+        .name(r.artist.name)
+        .description(r.artist.brief_desc)
+        .follower_count(fans)
+        .album_count(r.artist.album_size)
+        .song_count(r.artist.music_size)
+        .avatar_url(parse_remote_opt(r.artist.pic_url.as_deref()))
+        .songs(
+            r.hot_songs
+                .into_iter()
+                .map(album_song_to_model)
+                .collect::<Result<Vec<_>>>()?,
+        )
+        .build())
+}
+
+/// 转换艺人专辑页，并保留响应的 `more`；字段缺失时由上层按条数判断。
+pub(crate) fn artist_albums_to_model(result: ArtistAlbumsResult) -> Result<PageResult<Album>> {
+    Ok(PageResult {
+        items: result
+            .hot_albums
+            .into_iter()
+            .map(artist_album_to_model)
+            .collect::<Result<Vec<_>>>()?,
+        has_more: result.more,
+    })
+}
+
+/// artist 专辑列表项 → 统一 [`Album`](曲目留空,按需走 `album_detail`)。
+pub(crate) fn artist_album_to_model(a: ArtistAlbum) -> Result<Album> {
+    Ok(Album::builder()
+        .web_url(Some(WebPage::Album(a.id).into_url()?))
+        .id(AlbumId::new(SourceKind::NETEASE, a.id.to_string()))
+        .name(a.name)
+        .artists(album_artist_refs(a.artists, a.artist))
+        .company(a.company)
+        .publish_time_ms(a.publish_time)
+        .track_count(Some(a.size))
+        .cover_url(parse_remote_opt(a.pic_url.as_deref()))
+        .build())
+}
+
+/// 播放 URL 端点 DTO 列表 → [`DirectMedia`] 列表,丢弃不可播的项。
+///
+/// The requested tier stays with playback orchestration; media carries only source facts.
+pub(crate) fn to_direct_media(dtos: Vec<SongUrl>) -> Vec<DirectMedia> {
+    dtos.into_iter().filter_map(song_url_to_direct).collect()
+}
+
+/// 整批条目是否都**显式**报了「本源无资源」(单曲级 `code` 非 200)。
+///
+/// 全灰时 legacy 端点同样不会有资源,调用方据此省掉降级那一跳、直接返回空
+/// (playback orchestration 继而进入 unplayable 拦截口)。只认显式 code——
+/// code 缺失或试听片段不算,那些情形 legacy 仍可能给出完整流。
+pub(crate) fn all_explicitly_unavailable(dtos: &[SongUrl]) -> bool {
+    !dtos.is_empty() && dtos.iter().all(|d| d.code.is_some_and(|c| c != 200))
+}
+
+/// 单条播放 URL DTO → direct remote media;不可播返回 `None`。
+///
+/// 不可播三口:单曲级 `code` 非 200(实测无版权曲为 404,url 同时为 null)、
+/// `freeTrialInfo` 非空(url 只是试听片段——接受它会把片段当整曲播放并入缓存)、
+/// url 缺失。
+fn song_url_to_direct(d: SongUrl) -> Option<DirectMedia> {
+    if d.code.is_some_and(|c| c != 200) || d.free_trial_info.is_some() {
+        return None;
+    }
+    let url = url::Url::parse(&d.url?).ok()?;
+    let info = PlaybackMediaInfo {
+        song_id: SongId::new(SourceKind::NETEASE, d.id.to_string()),
+        // wire 层 br / size 缺字段经 serde default 落 0,在此边界转 None,哨兵不进模型。
+        bitrate_bps: (d.br > 0).then_some(d.br),
+        size: (d.size > 0).then_some(d.size),
+        format: d.format.filter(|s| !s.is_empty()).map(AudioFormat::from),
+        // 网易云播放接口的响应不含位深字段(实测 /song/url/v1 无 bitDepth),恒 None。
+        bit_depth: None,
+        substituted: false,
+    };
+    // 网易云音频 CDN 直链自足,不需附加取流头;整块直链(MP3 / FLAC)随机访问廉价。
+    Some(DirectMedia::remote(
+        info,
+        url,
+        Vec::new(),
+        mineral_model::StreamLayout::Contiguous,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use mineral_model::{AlbumId, SourceKind};
+
+    use super::album_detail_to_model;
+    use crate::wire::de::from_value;
+    use crate::wire::search::AlbumDetailResult;
+
+    /// 灰歌条目(code=404 + url null,真实响应形态)→ 滤掉;整批全灰 →
+    /// `all_explicitly_unavailable` 为 true(channel 据此不降级 legacy)。
+    #[test]
+    fn grey_entry_is_rejected_and_detected() -> color_eyre::Result<()> {
+        use super::{all_explicitly_unavailable, to_direct_media};
+        use crate::wire::song::SongUrl;
+
+        // 2026-07-04 实测 /song/enhance/player/url/v1 对无版权曲(id 186016)的形态。
+        let grey: SongUrl = from_value(serde_json::json!({
+            "id": 186016, "code": 404, "url": null, "br": 0, "size": 0, "type": null,
+            "freeTrialInfo": null
+        }))?;
+        assert!(
+            all_explicitly_unavailable(std::slice::from_ref(&grey)),
+            "整批显式非 200 应判定为本源无资源"
+        );
+        assert!(
+            to_direct_media(vec![grey]).is_empty(),
+            "灰歌条目不得产出 Direct media"
+        );
+        assert!(
+            !all_explicitly_unavailable(&[]),
+            "空批不算全灰(v1 异常形态,交给 legacy 降级)"
+        );
+        Ok(())
+    }
+
+    /// 试听片段(code=200 但 freeTrialInfo 非空)→ 不算可播,滤掉;且**不**算显式无资源
+    /// (legacy 可能给完整流,降级仍要走)。
+    #[test]
+    fn trial_fragment_is_not_playable() -> color_eyre::Result<()> {
+        use super::{all_explicitly_unavailable, to_direct_media};
+        use crate::wire::song::SongUrl;
+
+        let trial: SongUrl = from_value(serde_json::json!({
+            "id": 33894312, "code": 200, "url": "https://m7.music.126.net/trial.mp3",
+            "br": 320_000, "size": 1_048_576, "type": "mp3",
+            "freeTrialInfo": { "start": 45, "end": 75 }
+        }))?;
+        assert!(
+            !all_explicitly_unavailable(std::slice::from_ref(&trial)),
+            "试听不算显式无资源,legacy 降级仍要走"
+        );
+        assert!(
+            to_direct_media(vec![trial]).is_empty(),
+            "试听片段不得当完整可播流放行"
+        );
+        Ok(())
+    }
+
+    /// 正常条目(code=200 + 完整 url)照常产出;混批(灰 + 正常)不触发全灰判定。
+    #[test]
+    fn playable_entry_survives_mixed_batch() -> color_eyre::Result<()> {
+        use super::{all_explicitly_unavailable, to_direct_media};
+        use crate::wire::song::SongUrl;
+
+        let batch: Vec<SongUrl> = vec![
+            from_value(serde_json::json!({
+                "id": 186016, "code": 404, "url": null
+            }))?,
+            from_value(serde_json::json!({
+                "id": 1_862_188_922, "code": 200,
+                "url": "https://m7.music.126.net/full.mp3", "br": 320_000,
+                "size": 8_388_608, "type": "mp3"
+            }))?,
+        ];
+        assert!(!all_explicitly_unavailable(&batch), "混批不算全灰");
+        let streams = to_direct_media(batch);
+        assert_eq!(streams.len(), 1, "只有可播条目产出");
+        assert_eq!(
+            streams.first().map(|s| s.info().song_id.as_str()),
+            Some("1862188922")
+        );
+        Ok(())
+    }
+
+    /// 权限块 `st < 0`(实测下架灰歌 -200)→ `Song.unavailable`;
+    /// `st = 0` / 权限块缺失(旧端点形态)→ 可播。
+    #[test]
+    fn privilege_st_negative_marks_unavailable() -> color_eyre::Result<()> {
+        use super::album_song_to_model;
+        use crate::wire::song::AlbumSong;
+
+        // cloudsearch 形态:privilege 内联在歌曲对象上。
+        let grey: AlbumSong = from_value(serde_json::json!({
+            "id": 186_016, "name": "晴天",
+            "ar": [{ "id": 6452, "name": "周杰伦" }],
+            "al": { "id": 18896, "name": "葉惠美" },
+            "dt": 269_000,
+            "privilege": { "id": 186_016, "st": -200, "pl": 0, "dl": 0 }
+        }))?;
+        assert!(album_song_to_model(grey)?.unavailable, "st=-200 应判不可播");
+
+        let normal: AlbumSong = from_value(serde_json::json!({
+            "id": 1, "name": "ok", "al": { "id": 2, "name": "a" },
+            "privilege": { "id": 1, "st": 0 }
+        }))?;
+        assert!(!album_song_to_model(normal)?.unavailable, "st=0 应可播");
+
+        let missing: AlbumSong = from_value(serde_json::json!({
+            "id": 3, "name": "no-priv", "al": { "id": 4, "name": "b" }
+        }))?;
+        assert!(
+            !album_song_to_model(missing)?.unavailable,
+            "权限块缺失不得误判不可播"
+        );
+        Ok(())
+    }
+
+    /// 别名映射:**优先译名 `tns`,译名无效再退网易别名 `alia`**;两者都无 → `None`。
+    /// 全部用真实抓取样本(歌单 17880415607,MyGO!!!!!)——真实数据里 `tns` 常为 `null`、
+    /// 别名藏在 `alia`(副标题 / 罗马音 / 出处),故这条既锁映射策略也锁 `null` 容忍。
+    #[test]
+    fn alias_prefers_tns_then_falls_back_to_alia() -> color_eyre::Result<()> {
+        use super::album_song_to_model;
+        use crate::wire::song::AlbumSong;
+
+        let alias_of = |v: serde_json::Value| -> color_eyre::Result<Option<String>> {
+            let s: AlbumSong = from_value(v)?;
+            Ok(album_song_to_model(s)?.alias)
+        };
+
+        // tns=null(真实形态)、alia 有罗马音 → 退 alia。
+        assert_eq!(
+            alias_of(serde_json::json!({
+                "id": 1, "name": "迷星叫", "tns": null, "alia": ["Mayoiuta"],
+                "ar": [{ "id": 1, "name": "MyGO!!!!!" }], "al": { "id": 1, "name": "迷跡波" }
+            }))?
+            .as_deref(),
+            Some("Mayoiuta"),
+            "tns 为 null 时退 alia"
+        );
+
+        // tns 与 alia 都有 → 优先 tns(译名比出处别名更有意义)。
+        assert_eq!(
+            alias_of(serde_json::json!({
+                "id": 2, "name": "歌いましょう鳴らしましょう",
+                "tns": ["一同歌唱一同奏响"], "alia": ["游戏《BanG Dream! 少女乐团派对！》MyGO!!!!!登场纪念曲目"],
+                "al": { "id": 1, "name": "迷跡波" }
+            }))?
+            .as_deref(),
+            Some("一同歌唱一同奏响"),
+            "tns 有效时优先 tns 而非 alia"
+        );
+
+        // tns 与 alia 都空(真实:明弦音)→ None。
+        assert!(
+            alias_of(serde_json::json!({
+                "id": 3, "name": "明弦音", "tns": null, "alia": [],
+                "al": { "id": 1, "name": "迷跡波" }
+            }))?
+            .is_none(),
+            "tns/alia 都无应落 None"
+        );
+
+        // 空白 tns 不当值:跳过它退到 alia(不落 Some("") 哨兵)。
+        assert_eq!(
+            alias_of(serde_json::json!({
+                "id": 4, "name": "影色舞", "tns": ["", "  "], "alia": ["Silhouette Dance"],
+                "al": { "id": 1, "name": "迷跡波" }
+            }))?
+            .as_deref(),
+            Some("Silhouette Dance"),
+            "空白 tns 应跳过、退到 alia"
+        );
+        Ok(())
+    }
+
+    /// 专辑详情(顶层元信息 + 曲目)→ model:简介 / track_count / 曲目 / 封面 / id 都到位。
+    /// description 只由详情端点提供,必须保留进专辑信息。
+    #[test]
+    fn album_detail_maps_meta_and_songs() -> color_eyre::Result<()> {
+        let raw = serde_json::json!({
+            "album": {
+                "id": 3_314_467, "name": "Chinese Football",
+                "description": "成军四年的首张全长专辑。", "company": null,
+                "publishTime": 1_443_196_800_000_i64, "size": 13,
+                "picUrl": "https://p3.music.126.net/x.jpg",
+                "artists": [{ "id": 1_081_839, "name": "Chinese Football" }]
+            },
+            "songs": [
+                { "id": 1, "name": "电动少女",
+                  "ar": [{ "id": 1_081_839, "name": "Chinese Football" }],
+                  "al": { "id": 3_314_467, "name": "Chinese Football" }, "dt": 310_000 }
+            ]
+        });
+        let dto: AlbumDetailResult = from_value(raw)?;
+        let album = album_detail_to_model(dto)?;
+        assert_eq!(album.name, "Chinese Football");
+        assert_eq!(album.description, "成军四年的首张全长专辑。");
+        assert_eq!(album.track_count, Some(13));
+        assert_eq!(album.tracks.len(), 1);
+        assert_eq!(album.tracks.first().map(|track| track.index.get()), Some(0));
+        assert!(album.cover_url.is_some());
+        assert_eq!(album.id, AlbumId::new(SourceKind::NETEASE, "3314467"));
+        Ok(())
+    }
+
+    /// 多碟专辑只认响应顶层 `songs[]` 的 canonical order，并在 adapter boundary 摊平成
+    /// 连续 0-based index；`no` 在换碟后重新从 1 开始也不能让编号回退。
+    #[test]
+    fn album_multi_disc_flattens_top_level_order() -> color_eyre::Result<()> {
+        let raw = serde_json::json!({
+            "album": {
+                "id": 42, "name": "Double Album", "size": 4,
+                "artists": [{ "id": 7, "name": "Artist" }]
+            },
+            "songs": [
+                { "id": 11, "name": "Disc 1 Track 1", "no": 1, "cd": "1",
+                  "ar": [{ "id": 7, "name": "Artist" }],
+                  "al": { "id": 42, "name": "Double Album" } },
+                { "id": 12, "name": "Disc 1 Track 2", "no": 2, "cd": "1",
+                  "ar": [{ "id": 7, "name": "Artist" }],
+                  "al": { "id": 42, "name": "Double Album" } },
+                { "id": 21, "name": "Disc 2 Track 1", "no": 1, "cd": "2",
+                  "ar": [{ "id": 7, "name": "Artist" }],
+                  "al": { "id": 42, "name": "Double Album" } },
+                { "id": 22, "name": "Disc 2 Track 2", "no": 2, "cd": "2",
+                  "ar": [{ "id": 7, "name": "Artist" }],
+                  "al": { "id": 42, "name": "Double Album" } }
+            ]
+        });
+        let dto: AlbumDetailResult = from_value(raw)?;
+        let album = album_detail_to_model(dto)?;
+        let ids = album
+            .tracks
+            .iter()
+            .map(|track| track.song.id.value())
+            .collect::<Vec<_>>();
+        let indexes = album
+            .tracks
+            .iter()
+            .map(|track| track.index.get())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["11", "12", "21", "22"]);
+        assert_eq!(indexes, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    /// 歌单详情(顶层元信息 + 曲目)→ model:简介 / 计数 / play_count / 曲目都到位。
+    #[test]
+    fn playlist_detail_maps_meta_and_songs() -> color_eyre::Result<()> {
+        use mineral_model::PlaylistId;
+
+        use super::{album_song_to_model, playlist_entries_from_order, playlist_info_to_model};
+        use crate::wire::playlist::PlaylistDetailResult;
+
+        let raw = serde_json::json!({
+            "playlist": {
+                "id": 12345, "name": "City Pop", "description": "昭和旋律",
+                "coverImgUrl": "https://p.music.126.net/c.jpg",
+                "trackCount": 147, "playCount": 8_941_862, "subscribedCount": 110_577,
+                "trackUpdateTime": 1_700_000_000_000_i64,
+                "trackIds": [{ "id": 2 }, { "id": 1 }],
+                "tracks": [
+                    { "id": 1, "name": "Plastic Love",
+                      "ar": [{ "id": 9, "name": "竹内まりや" }],
+                      "al": { "id": 3, "name": "VARIETY" }, "dt": 290_000 }
+                ]
+            }
+        });
+        let dto: PlaylistDetailResult = from_value(raw)?;
+        let mut info = dto.playlist;
+        let songs = std::mem::take(&mut info.tracks)
+            .into_iter()
+            .map(album_song_to_model)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let entries = playlist_entries_from_order(&info.track_ids, songs);
+        let pl = playlist_info_to_model(&info, entries)?;
+        assert_eq!(pl.name, "City Pop");
+        assert_eq!(pl.description, "昭和旋律");
+        assert_eq!(pl.track_count, 147);
+        assert_eq!(pl.play_count, Some(8_941_862));
+        assert_eq!(pl.subscriber_count, Some(110_577));
+        assert_eq!(pl.entries.len(), 1);
+        assert_eq!(
+            pl.entries.first().map(|entry| entry.index.get()),
+            Some(1),
+            "trackIds[0] metadata 缺失时，后续 Song 保留 authoritative index 1"
+        );
+        assert_eq!(pl.id, PlaylistId::new(SourceKind::NETEASE, "12345"));
+        Ok(())
+    }
+
+    /// artist 详情响应 → model:id 入 NETEASE namespace、briefDesc → description、
+    /// albumSize/musicSize → 计数、hotSongs → songs 全量映射、fans 来自聚合参数。
+    #[test]
+    fn detail_maps_to_model_artist() -> color_eyre::Result<()> {
+        use super::artist_detail_to_model;
+        use crate::wire::artist::ArtistDetailResult;
+
+        // 详情端点不带粉丝数(顶层无 fansCount),粉丝数由 follow/count 端点单独取、聚合时传入。
+        let raw = serde_json::json!({
+            "artist": { "id": 11127, "name": "Beyond", "briefDesc": "香港摇滚乐队",
+                        "picUrl": "https://p1.music.126.net/x.jpg",
+                        "albumSize": 146, "musicSize": 2570 },
+            "hotSongs": [
+                { "id": 1, "name": "海阔天空", "ar": [{ "id": 11127, "name": "Beyond" }],
+                  "al": { "id": 9, "name": "乐与怒" }, "dt": 323_000 }
+            ]
+        });
+        let dto: ArtistDetailResult = from_value(raw)?;
+        let model = artist_detail_to_model(dto, /*fans*/ Some(8_900_000))?;
+        assert_eq!(model.album_count, Some(146));
+        assert_eq!(model.song_count, Some(2570));
+        assert_eq!(model.follower_count, Some(8_900_000));
+        mineral_test::assert_snap_debug!("artist 详情映射成统一 Artist(Beyond + 1 热门曲)", model);
+        Ok(())
+    }
+
+    /// 专辑页保留明确的 more；缺失或 null 不得变成末页信号。
+    #[test]
+    fn artist_albums_preserve_pagination_signal() -> color_eyre::Result<()> {
+        use super::artist_albums_to_model;
+        use crate::wire::artist::ArtistAlbumsResult;
+
+        for (pagination, expected) in [
+            (serde_json::json!({ "more": true }), Some(true)),
+            (serde_json::json!({ "more": false }), Some(false)),
+            (serde_json::json!({ "more": null }), None),
+            (serde_json::json!({}), None),
+        ] {
+            let mut raw = pagination;
+            raw["hotAlbums"] = serde_json::json!([
+                { "id": 8, "name": "继续革命", "publishTime": 715_000_000_000_i64 }
+            ]);
+            let dto = from_value::<ArtistAlbumsResult>(raw)?;
+            let result = artist_albums_to_model(dto)?;
+            assert_eq!(result.has_more, expected);
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(
+                result.items.first().map(|album| &album.id),
+                Some(&mineral_model::AlbumId::new(SourceKind::NETEASE, "8"))
+            );
+        }
+        Ok(())
+    }
+
+    /// artist 专辑列表项 → model:无主艺术家时 artists 为空,曲目恒空。
+    #[test]
+    fn album_item_without_artist_maps_to_empty_artists() -> color_eyre::Result<()> {
+        use super::artist_album_to_model;
+        use crate::wire::artist::ArtistAlbum;
+
+        let raw =
+            serde_json::json!({ "id": 8, "name": "继续革命", "publishTime": 715_000_000_000_i64 });
+        let dto: ArtistAlbum = from_value(raw)?;
+        let model = artist_album_to_model(dto)?;
+        assert!(model.artists.is_empty());
+        assert!(model.tracks.is_empty());
+        assert_eq!(model.publish_time_ms, Some(715_000_000_000));
+        Ok(())
+    }
+
+    /// 建单响应(`playlist` 对象,复用 `PlaylistInfo` 形态)→ model:
+    /// NETEASE namespace、null 描述 → 空串、无曲目、play/subscriber 计数留 None。
+    #[test]
+    fn create_response_maps_to_playlist() -> color_eyre::Result<()> {
+        use mineral_model::PlaylistId;
+
+        use super::playlist_info_to_model;
+        use crate::wire::playlist::CreatePlaylistResult;
+
+        let raw = serde_json::json!({
+            "code": 200, "id": 987_654,
+            "playlist": { "id": 987_654, "name": "开车歌单", "trackCount": 0,
+                          "coverImgUrl": "https://p1.music.126.net/c.jpg", "description": null }
+        });
+        let dto: CreatePlaylistResult = from_value(raw)?;
+        let pl = playlist_info_to_model(&dto.playlist, Vec::new())?;
+        assert_eq!(pl.id, PlaylistId::new(SourceKind::NETEASE, "987654"));
+        assert_eq!(pl.name, "开车歌单");
+        assert_eq!(pl.description, "");
+        assert_eq!(pl.track_count, 0);
+        assert!(pl.cover_url.is_some());
+        assert!(pl.play_count.is_none());
+        assert!(pl.subscriber_count.is_none());
+        Ok(())
+    }
+}

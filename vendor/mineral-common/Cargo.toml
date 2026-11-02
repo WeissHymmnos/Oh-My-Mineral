@@ -1,0 +1,9 @@
+[package]
+name = "mineral-common"
+description = "跨模块共享的基础类型"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

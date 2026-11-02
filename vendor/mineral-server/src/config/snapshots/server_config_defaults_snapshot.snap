@@ -7,6 +7,7 @@ ServerConfig {
     engine: EngineParams {
         initial_volume: 100,
         tick_ms: 20,
+        pcm_buffer_ms: 200,
         prefetch_bytes: 262144,
         tap_capacity: 8192,
     },
@@ -36,7 +37,7 @@ ServerConfig {
         tagging_workers: 4,
     },
     timing: ServerTiming {
-        gapless_prefetch_ms: 10000,
+        gapless_prefetch_ms: 20000,
         prev_restart_threshold_ms: 3000,
         player_tick_ms: 20,
         session_save_secs: 15,

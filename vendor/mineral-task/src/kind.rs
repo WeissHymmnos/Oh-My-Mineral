@@ -1,0 +1,242 @@
+//! 任务种类与 dedup 键。
+
+use mineral_model::{
+    AlbumId, ArtistId, CollectionCategory, PlaylistId, RefreshScope, SearchKind, SongId, SourceKind,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::write::PlaylistWriteOp;
+
+/// 一个待调度任务的所有信息。具体业务参数挂在子枚举里。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TaskKind {
+    /// channel 数据拉取。
+    ChannelFetch(ChannelFetchKind),
+
+    /// 歌单写操作，由每个 source 的专用 worker 串行执行。
+    PlaylistWrite(PlaylistWriteOp),
+}
+
+impl TaskKind {
+    /// 用于 ongoing 去重:相同 key 的任务在 ongoing 里只保留一条;后到的命中既存任务。
+    pub fn dedup_key(&self) -> DedupKey {
+        match self {
+            Self::ChannelFetch(k) => DedupKey(format!("ChannelFetch:{}", k.dedup_part())),
+            Self::PlaylistWrite(op) => DedupKey(format!("PlaylistWrite:{}", op.dedup_part())),
+        }
+    }
+}
+
+/// channel 数据拉取的具体形态。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChannelFetchKind {
+    /// 拉某 channel 当前用户的歌单列表。
+    MyPlaylists {
+        /// 目标 channel。
+        source: SourceKind,
+    },
+
+    /// 拉歌单详情(元信息 + 曲目;目标 channel 由 `id` 的 namespace 决定)。
+    PlaylistDetail {
+        /// 歌单 id(自带 namespace)。
+        id: PlaylistId,
+    },
+
+    /// 拉某首歌的歌词(目标 channel 由 `song_id` 的 namespace 决定)。
+    Lyrics {
+        /// 歌曲 id(自带 namespace)。
+        song_id: SongId,
+    },
+
+    /// 拉某首歌的远端真实累计播放次数(目标 channel 由 `song_id` 的 namespace 决定)。
+    RemotePlayCount {
+        /// 歌曲 id(自带 namespace)。
+        song_id: SongId,
+    },
+
+    /// 来源搜索；有限任务读取首批，订阅读取逐批复用同一个流。
+    Search {
+        /// 目标 channel。
+        source: SourceKind,
+
+        /// 搜索实体类型。
+        kind: SearchKind,
+
+        /// 关键词。
+        query: String,
+    },
+
+    /// 拉 artist 详情(简介 + 热门曲目;目标 channel 由 `id` 的 namespace 决定)。
+    ArtistDetail {
+        /// artist id(自带 namespace)。
+        id: ArtistId,
+    },
+
+    /// 艺人专辑读取；有限任务取首批，订阅沿用同一流继续读取。
+    ArtistAlbums {
+        /// artist id(自带 namespace)。
+        id: ArtistId,
+    },
+
+    /// 拉专辑详情(元信息 + 曲目;目标 channel 由 `id` 的 namespace 决定)。
+    AlbumDetail {
+        /// 专辑 id(自带 namespace)。
+        id: AlbumId,
+    },
+
+    /// 拉取当前账号收藏的专辑。
+    MyAlbums {
+        /// 目标音乐来源。
+        source: SourceKind,
+    },
+}
+
+impl ChannelFetchKind {
+    /// Refreshes invalidate every load intent for a parent, but no playback task.
+    pub fn affected_by(&self, scope: &RefreshScope) -> bool {
+        match scope {
+            RefreshScope::Collections(CollectionCategory::Playlists) => {
+                matches!(self, Self::MyPlaylists { .. } | Self::PlaylistDetail { .. })
+            }
+            RefreshScope::Collections(CollectionCategory::Albums) => {
+                matches!(self, Self::MyAlbums { .. } | Self::AlbumDetail { .. })
+            }
+            RefreshScope::Playlist(parent) => {
+                matches!(self, Self::PlaylistDetail { id, .. } if id == parent)
+            }
+            RefreshScope::Album(parent) => matches!(self, Self::AlbumDetail { id } if id == parent),
+        }
+    }
+    /// 产出 dedup key 的可变部分(channel + 子操作 + 关键参数)。
+    ///
+    /// 带 id 的形态用 `id.qualified()`(namespace 已在 id 内,自然带上来源);
+    /// 只有 source 的形态(无 id 可派生)仍显式拼 `{source:?}`。
+    fn dedup_part(&self) -> String {
+        match self {
+            Self::MyAlbums { source } => format!("{source:?}:my_albums"),
+            Self::MyPlaylists { source } => format!("{source:?}:my_playlists"),
+            Self::PlaylistDetail { id } => {
+                format!("playlist_detail:{}", id.qualified())
+            }
+            Self::Lyrics { song_id } => format!("lyrics:{}", song_id.qualified()),
+            Self::RemotePlayCount { song_id } => {
+                format!("remote_play_count:{}", song_id.qualified())
+            }
+            Self::Search {
+                source,
+                kind,
+                query,
+            } => format!("search:{source:?}:{kind:?}:{query}"),
+            Self::ArtistDetail { id } => format!("artist_detail:{}", id.qualified()),
+            Self::ArtistAlbums { id } => {
+                format!("artist_albums:{}", id.qualified())
+            }
+            Self::AlbumDetail { id } => format!("album_detail:{}", id.qualified()),
+        }
+    }
+
+    /// 该任务针对的 channel(给 lane 路由 worker 用)。
+    ///
+    /// 带 id 的形态从 id 的 namespace 派生;只有 source 的形态直接返回。
+    pub fn source(&self) -> SourceKind {
+        match self {
+            Self::MyAlbums { source }
+            | Self::MyPlaylists { source }
+            | Self::Search { source, .. } => *source,
+            Self::PlaylistDetail { id, .. } => id.namespace(),
+            Self::Lyrics { song_id } | Self::RemotePlayCount { song_id } => song_id.namespace(),
+            Self::ArtistDetail { id } | Self::ArtistAlbums { id, .. } => id.namespace(),
+            Self::AlbumDetail { id } => id.namespace(),
+        }
+    }
+
+    /// 取数目标的 qualified 引用(埋点 fetches.target_ref 用);只有 source 的形态无目标。
+    pub fn target_ref(&self) -> Option<String> {
+        match self {
+            Self::MyAlbums { .. } | Self::MyPlaylists { .. } | Self::Search { .. } => None,
+            Self::PlaylistDetail { id, .. } => Some(id.qualified()),
+            Self::Lyrics { song_id } | Self::RemotePlayCount { song_id } => {
+                Some(song_id.qualified())
+            }
+            Self::ArtistDetail { id } | Self::ArtistAlbums { id, .. } => Some(id.qualified()),
+            Self::AlbumDetail { id } => Some(id.qualified()),
+        }
+    }
+}
+
+/// [`ChannelFetchKind`] 的 wire-friendly 标签:无字段 enum,可哈希、可序列化。
+///
+/// 用于按 fetch kind 统计运行中的任务数量。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChannelFetchKindTag {
+    /// 对应 [`ChannelFetchKind::MyPlaylists`]。
+    MyPlaylists,
+
+    /// 对应 [`ChannelFetchKind::PlaylistDetail`]。
+    PlaylistDetail,
+
+    /// 对应 [`ChannelFetchKind::Lyrics`]。
+    Lyrics,
+
+    /// 对应 [`ChannelFetchKind::RemotePlayCount`]。
+    RemotePlayCount,
+
+    /// 对应 [`ChannelFetchKind::Search`]。
+    Search,
+
+    /// 对应 [`ChannelFetchKind::ArtistDetail`]。
+    ArtistDetail,
+
+    /// 对应 [`ChannelFetchKind::ArtistAlbums`]。
+    ArtistAlbums,
+
+    /// 对应 [`ChannelFetchKind::AlbumDetail`]。
+    AlbumDetail,
+
+    /// 当前账号收藏的专辑列表。
+    MyAlbums,
+}
+
+impl ChannelFetchKindTag {
+    /// 取一个具体 [`ChannelFetchKind`] 的标签。
+    #[must_use]
+    pub fn of(kind: &ChannelFetchKind) -> Self {
+        match kind {
+            ChannelFetchKind::MyPlaylists { .. } => Self::MyPlaylists,
+            ChannelFetchKind::MyAlbums { .. } => Self::MyAlbums,
+            ChannelFetchKind::PlaylistDetail { .. } => Self::PlaylistDetail,
+            ChannelFetchKind::Lyrics { .. } => Self::Lyrics,
+            ChannelFetchKind::RemotePlayCount { .. } => Self::RemotePlayCount,
+            ChannelFetchKind::Search { .. } => Self::Search,
+            ChannelFetchKind::ArtistDetail { .. } => Self::ArtistDetail,
+            ChannelFetchKind::ArtistAlbums { .. } => Self::ArtistAlbums,
+            ChannelFetchKind::AlbumDetail { .. } => Self::AlbumDetail,
+        }
+    }
+
+    /// 稳定 snake_case 名(埋点 fetches.fetch_kind 用)。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MyPlaylists => "my_playlists",
+            Self::MyAlbums => "my_albums",
+            Self::PlaylistDetail => "playlist_detail",
+            Self::Lyrics => "lyrics",
+            Self::RemotePlayCount => "remote_play_count",
+            Self::Search => "search",
+            Self::ArtistDetail => "artist_detail",
+            Self::ArtistAlbums => "artist_albums",
+            Self::AlbumDetail => "album_detail",
+        }
+    }
+}
+
+/// 任务去重键(`Eq + Hash` 安全)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DedupKey(String);
+
+impl std::fmt::Display for DedupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}

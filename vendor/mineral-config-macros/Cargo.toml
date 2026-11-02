@@ -1,0 +1,13 @@
+[package]
+name = "mineral-config-macros"
+description = "Mineral daemon/TUI 配置 schema 与 LuaLS 生成宏"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"

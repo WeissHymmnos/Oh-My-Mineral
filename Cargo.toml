@@ -6,9 +6,19 @@ members = [
   "crates/mineral-gui-gtk",
   "crates/mineral-gui-qt",
 ]
+exclude = ["vendor"]
 
 [patch.crates-io]
-mineral-paths = { path = "vendor/mineral-paths" }
-mineral-protocol = { path = "vendor/mineral-protocol" }
-mineral-script = { path = "vendor/mineral-script" }
-mineral-server = { path = "vendor/mineral-server" }
+symphonia-bundle-flac = { path = "vendor/symphonia-bundle-flac" }
+symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "unwind"
+

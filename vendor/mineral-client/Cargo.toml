@@ -1,0 +1,20 @@
+[package]
+name = "mineral-client"
+description = "Mineral 与传输无关的 client 会话核心:请求合批、结果配对、状态镜像与 PCM 窗口"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mineral-common = { path = "../mineral-common", version = "0.6.0" }
+mineral-audio = { path = "../mineral-audio", version = "0.6.0" }
+mineral-channel-core = { path = "../mineral-channel-core", version = "0.6.0" }
+mineral-log = { path = "../mineral-log", version = "0.6.0" }
+mineral-model = { path = "../mineral-model", version = "0.6.0" }
+mineral-protocol = { path = "../mineral-protocol", version = "0.6.0" }
+mineral-task = { path = "../mineral-task", version = "0.6.0" }
+parking_lot = "0.12"
+rustc-hash = "2"
+thiserror = "1"
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
